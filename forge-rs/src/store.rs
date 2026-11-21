@@ -489,9 +489,9 @@ pub fn build_commit(
 pub fn format_iso8601(epoch_sec: i64) -> String {
     let days = epoch_sec.div_euclid(86400);
     let rem = epoch_sec.rem_euclid(86400);
-    let hour = rem / 3600;
-    let min = (rem % 3600) / 60;
-    let sec = rem % 60;
+    let hour = (rem / 3600) as u8;
+    let min = ((rem % 3600) / 60) as u8;
+    let sec = (rem % 60) as u8;
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
@@ -499,10 +499,31 @@ pub fn format_iso8601(epoch_sec: i64) -> String {
     let y = (yoe as i64) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z", year, m, d, hour, min, sec)
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u8;
+    let year = (if m <= 2 { y + 1 } else { y }) as u32;
+    let mut b = [0u8; 24];
+    b[0] = b'0' + ((year / 1000) % 10) as u8;
+    b[1] = b'0' + ((year / 100) % 10) as u8;
+    b[2] = b'0' + ((year / 10) % 10) as u8;
+    b[3] = b'0' + (year % 10) as u8;
+    b[4] = b'-';
+    b[5] = b'0' + (m / 10);
+    b[6] = b'0' + (m % 10);
+    b[7] = b'-';
+    b[8] = b'0' + (d / 10);
+    b[9] = b'0' + (d % 10);
+    b[10] = b'T';
+    b[11] = b'0' + (hour / 10);
+    b[12] = b'0' + (hour % 10);
+    b[13] = b':';
+    b[14] = b'0' + (min / 10);
+    b[15] = b'0' + (min % 10);
+    b[16] = b':';
+    b[17] = b'0' + (sec / 10);
+    b[18] = b'0' + (sec % 10);
+    b[19..24].copy_from_slice(b".000Z");
+    unsafe { String::from_utf8_unchecked(b.to_vec()) }
 }
 
 pub fn parse_iso8601_epoch(s: &str) -> Option<i64> {
@@ -600,8 +621,15 @@ pub fn base64_decode(input: &[u8]) -> Vec<u8> {
 }
 
 pub fn encode_node_id(prefix: &str, id: u64) -> String {
-    let raw = format!("{}:{}", prefix, id);
-    base64url_encode(raw.as_bytes())
+    let mut raw = [0u8; 32];
+    let pb = prefix.as_bytes();
+    raw[..pb.len()].copy_from_slice(pb);
+    raw[pb.len()] = b':';
+    let mut nbuf = [0u8; 20];
+    let nb = fmt_usize(id as usize, &mut nbuf);
+    let start = pb.len() + 1;
+    raw[start..start + nb.len()].copy_from_slice(nb);
+    base64url_encode(&raw[..start + nb.len()])
 }
 
 pub fn decode_node_id(node_id: &str) -> Option<(String, u64)> {

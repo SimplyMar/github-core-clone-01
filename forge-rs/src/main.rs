@@ -290,7 +290,6 @@ fn try_process_one_request(
 // =========================================================================
 #[cfg(target_os = "linux")]
 fn run_server(listener: TcpListener) {
-    use rustc_hash::FxHashMap;
     use std::io::ErrorKind;
     use std::net::TcpStream;
     use std::os::fd::{AsRawFd, RawFd};
@@ -319,7 +318,8 @@ fn run_server(listener: TcpListener) {
     }
 
     let mut store = ForgeStore::new();
-    let mut conns: FxHashMap<RawFd, Conn> = FxHashMap::default();
+    // O(1) direct FD table — zero hashing!
+    let mut conns: Vec<Option<Conn>> = (0..256).map(|_| None).collect();
     let mut resp_buf = Vec::with_capacity(65536);
     let mut scratch_buf = Vec::with_capacity(4096);
     let mut decomp = Decompress::new(true);
@@ -342,6 +342,10 @@ fn run_server(listener: TcpListener) {
                             let _ = stream.set_nonblocking(true);
                             let _ = stream.set_nodelay(true);
                             let cfd = stream.as_raw_fd();
+                            let idx = cfd as usize;
+                            if idx >= conns.len() {
+                                conns.resize_with(idx + 64, || None);
+                            }
                             let mut cev = libc::epoll_event {
                                 events: libc::EPOLLIN as u32,
                                 u64: cfd as u64,
@@ -349,18 +353,15 @@ fn run_server(listener: TcpListener) {
                             unsafe {
                                 libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, cfd, &mut cev);
                             }
-                            conns.insert(
-                                cfd,
-                                Conn {
-                                    stream,
-                                    read_buf: vec![0u8; 4096],
-                                    filled: 0,
-                                    write_buf: Vec::new(),
-                                    write_pos: 0,
-                                    want_out: false,
-                                    close_after_write: false,
-                                },
-                            );
+                            conns[idx] = Some(Conn {
+                                stream,
+                                read_buf: vec![0u8; 8192],
+                                filled: 0,
+                                write_buf: Vec::new(),
+                                write_pos: 0,
+                                want_out: false,
+                                close_after_write: false,
+                            });
                         }
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(_) => break,
@@ -369,12 +370,15 @@ fn run_server(listener: TcpListener) {
                 continue;
             }
 
+            let idx = fd as usize;
+            if idx >= conns.len() {
+                continue;
+            }
             let mut drop_conn = (ev_flags & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32)) != 0
                 && (ev_flags & libc::EPOLLIN as u32) == 0;
 
             if !drop_conn {
-                if let Some(conn) = conns.get_mut(&fd) {
-                    // Flush any pending write_buf first
+                if let Some(conn) = conns[idx].as_mut() {
                     if conn.write_pos < conn.write_buf.len() {
                         while conn.write_pos < conn.write_buf.len() {
                             match conn.stream.write(&conn.write_buf[conn.write_pos..]) {
@@ -409,16 +413,16 @@ fn run_server(listener: TcpListener) {
                         }
                     }
 
-                    // Read available bytes if not waiting on write drain
                     if !drop_conn && conn.write_pos >= conn.write_buf.len() && (ev_flags & libc::EPOLLIN as u32) != 0 {
+                        let mut peer_eof = false;
                         loop {
                             if conn.filled == conn.read_buf.len() {
-                                let new_len = (conn.read_buf.len() * 2).max(8192);
+                                let new_len = (conn.read_buf.len() * 2).max(16384);
                                 conn.read_buf.resize(new_len, 0);
                             }
                             match conn.stream.read(&mut conn.read_buf[conn.filled..]) {
                                 Ok(0) => {
-                                    drop_conn = true;
+                                    peer_eof = true;
                                     break;
                                 }
                                 Ok(n) => {
@@ -436,7 +440,6 @@ fn run_server(listener: TcpListener) {
                             }
                         }
 
-                        // Process all complete HTTP requests in read_buf
                         while !drop_conn && conn.filled > 0 && conn.write_buf.is_empty() {
                             match try_process_one_request(
                                 &conn.read_buf[..conn.filled],
@@ -460,7 +463,6 @@ fn run_server(listener: TcpListener) {
                                         conn.filled = rem;
                                     }
 
-                                    // Fast-path: single write() directly from resp_buf!
                                     let mut written = 0;
                                     while written < resp_buf.len() {
                                         match conn.stream.write(&resp_buf[written..]) {
@@ -472,7 +474,7 @@ fn run_server(listener: TcpListener) {
                                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                                                 conn.write_buf.extend_from_slice(&resp_buf[written..]);
                                                 conn.write_pos = 0;
-                                                conn.close_after_write = !keep_alive;
+                                                conn.close_after_write = !keep_alive || peer_eof;
                                                 if !conn.want_out {
                                                     conn.want_out = true;
                                                     let mut cev = libc::epoll_event {
@@ -498,6 +500,10 @@ fn run_server(listener: TcpListener) {
                                 }
                             }
                         }
+
+                        if peer_eof && conn.write_buf.is_empty() {
+                            drop_conn = true;
+                        }
                     }
                 }
             }
@@ -506,7 +512,7 @@ fn run_server(listener: TcpListener) {
                 unsafe {
                     libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
                 }
-                conns.remove(&fd);
+                conns[idx] = None;
             }
         }
     }

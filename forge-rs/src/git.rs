@@ -322,13 +322,11 @@ pub fn unpack_packfile(
             pos += 20;
         }
 
-        let zlib_start = pos;
         let (data, next_pos) = inflate_pack_entry(decomp, inflate_tmp, pack, pos, size)?;
         pos = next_pos;
 
         if let Some(kind) = GitObjectKind::from_num(type_num) {
-            let raw_zlib = Some(pack[zlib_start..next_pos].to_vec());
-            let oid = ForgeStore::put_object(repo, kind, data, raw_zlib);
+            let oid = ForgeStore::put_object(repo, kind, data, None);
             offset_oids.push((entry_offset, oid));
         } else if type_num == 6 {
             let base_off = entry_offset.checked_sub(ofs_dist).ok_or("Invalid OFS_DELTA offset")?;
@@ -1017,7 +1015,7 @@ pub fn handle_git_request(
             }
         }
 
-        // Stack-allocated report buffer for zero-alloc push replies!
+        let mut cache_buf = repo.receive_refs_http_cache.take().unwrap_or_else(|| Vec::with_capacity(384));
         let mut report = Vec::with_capacity(96);
         if let Some(err_msg) = unpack_err {
             let mut line = [0u8; 128];
@@ -1032,6 +1030,7 @@ pub fn handle_git_request(
                 let ng = format!("ng {} unpack failed\n", cmd.ref_name);
                 push_pkt_line(&mut report, ng.as_bytes());
             }
+            repo.receive_refs_http_cache = Some(cache_buf);
         } else {
             push_pkt_line(&mut report, b"unpack ok\n");
             for cmd in &commands {
@@ -1069,8 +1068,6 @@ pub fn handle_git_request(
                 ok_b[3 + rlen] = b'\n';
                 push_pkt_line(&mut report, &ok_b[..4 + rlen]);
             }
-            // Reuse cached Vec capacity when rebuilding receive_refs_http_cache!
-            let mut cache_buf = repo.receive_refs_http_cache.take().unwrap_or_else(|| Vec::with_capacity(384));
             build_receive_refs_http(repo, &mut cache_buf);
             repo.receive_refs_http_cache = Some(cache_buf);
         }
