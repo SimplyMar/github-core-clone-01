@@ -5,6 +5,7 @@ use crate::store::{
 use rustc_hash::FxHashMap;
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::sync::Arc;
 
 #[inline]
 pub fn write_json_str(out: &mut Vec<u8>, s: &str) {
@@ -123,18 +124,17 @@ pub fn write_issue_json(out: &mut Vec<u8>, i: &Issue) {
     out.push(b'}');
 }
 
-pub fn build_issue_http_200(issue: &Issue) -> Vec<u8> {
-    let mut body = Vec::with_capacity(512 + issue.title.len() + issue.body.len());
+pub fn build_issue_http_200(issue: &Issue) -> Arc<Vec<u8>> {
+    let mut body = Vec::with_capacity(384 + issue.title.len() + issue.body.len());
     write_issue_json(&mut body, issue);
-    body.push(b'\n');
-    let mut resp = Vec::with_capacity(body.len() + 160);
+    let mut resp = Vec::with_capacity(body.len() + 112);
     resp.extend_from_slice(
-        b"HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: r1\r\ncontent-length: ",
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-github-request-id: 1\r\ncontent-length: ",
     );
     write_u64(&mut resp, body.len() as u64);
-    resp.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
+    resp.extend_from_slice(b"\r\n\r\n");
     resp.extend_from_slice(&body);
-    resp
+    Arc::new(resp)
 }
 
 pub fn format_user_val(u: &UserObj) -> Value {
@@ -227,27 +227,26 @@ pub fn format_pull_val(repo: &Repo, p: &PullRequest) -> Value {
 pub fn write_http_json_raw(out: &mut Vec<u8>, status: &str, extra_headers: &str, body_bytes: &[u8]) {
     out.extend_from_slice(b"HTTP/1.1 ");
     out.extend_from_slice(status.as_bytes());
-    out.extend_from_slice(b"\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: r1\r\n");
+    out.extend_from_slice(b"\r\ncontent-type: application/json\r\nx-github-request-id: 1\r\n");
     if !extra_headers.is_empty() {
         out.extend_from_slice(extra_headers.as_bytes());
     }
     out.extend_from_slice(b"content-length: ");
     write_u64(out, body_bytes.len() as u64);
-    out.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
+    out.extend_from_slice(b"\r\n\r\n");
     out.extend_from_slice(body_bytes);
 }
 
 #[inline]
 pub fn write_http_json(out: &mut Vec<u8>, status: &str, extra_headers: &str, val: &Value) {
-    let mut s = serde_json::to_vec(val).unwrap();
-    s.push(b'\n');
+    let s = serde_json::to_vec(val).unwrap();
     write_http_json_raw(out, status, extra_headers, &s);
 }
 
 #[inline]
 pub fn write_http_204(out: &mut Vec<u8>) {
     out.extend_from_slice(
-        b"HTTP/1.1 204 No Content\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: r1\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n",
+        b"HTTP/1.1 204 No Content\r\ncontent-type: application/json\r\nx-github-request-id: 1\r\ncontent-length: 0\r\n\r\n",
     );
 }
 
@@ -397,6 +396,35 @@ fn parse_simple_json_str(raw: &[u8], start: usize) -> Option<(String, usize)> {
     Some((String::from_utf8(out).ok()?, i + 1))
 }
 
+// Shared-read L1 fast path for GET /api/v3/repos/{owner}/{repo}/issues/{number} (zero copy, RwLock::read only!)
+#[inline]
+pub fn try_handle_rest_read_fast(
+    store: &ForgeStore,
+    method: &str,
+    path: &str,
+    auth: Option<&[u8]>,
+) -> Option<Arc<Vec<u8>>> {
+    if method != "GET" || !path.starts_with("/api/v3/repos/") {
+        return None;
+    }
+    let tail = &path[14..];
+    let mut parts = tail.split('/');
+    let (Some(o_raw), Some(r_raw), Some("issues"), Some(num_str), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let num = num_str.parse::<u64>().ok()?;
+    if !store.is_authorized(auth) {
+        return None;
+    }
+    let owner = percent_decode_cow(o_raw);
+    let repo_name = percent_decode_cow(r_raw);
+    let repo = store.get_repo(owner.as_ref(), repo_name.as_ref())?;
+    let issue = repo.get_issue(num)?;
+    issue.cached_http_get.as_ref().map(Arc::clone)
+}
+
 pub fn handle_rest_request(
     store: &mut ForgeStore,
     method: &str,
@@ -408,7 +436,7 @@ pub fn handle_rest_request(
     scratch_body: &mut Vec<u8>,
     resp_out: &mut Vec<u8>,
 ) {
-    // ULTRA-FAST PATH 1: GET /api/v3/repos/{owner}/{repo}/issues/{number} (ZERO ALLOCATIONS, ZERO LOCKS!)
+    // ULTRA-FAST PATH 1: GET /api/v3/repos/{owner}/{repo}/issues/{number}
     if method == "GET" && path.starts_with("/api/v3/repos/") {
         let tail = &path[14..];
         let mut parts = tail.split('/');
@@ -477,7 +505,6 @@ pub fn handle_rest_request(
                     let issue = store.repos[repo_idx].get_issue(num).unwrap();
                     scratch_body.clear();
                     write_issue_json(scratch_body, issue);
-                    scratch_body.push(b'\n');
                     write_http_json_raw(resp_out, "201 Created", "", scratch_body);
                 }
                 return;

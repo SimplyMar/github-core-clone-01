@@ -6,18 +6,23 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, 
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha1::{Digest, Sha1};
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+const UPLOAD_PACK_V2_BODY: &[u8] = b"000eversion 2\n000cls-refs\n0012fetch=shallow\n0000";
+const _: () = assert!(UPLOAD_PACK_V2_BODY.len() == 48);
 
 pub const UPLOAD_PACK_V2_HTTP: &[u8] = concat!(
     "HTTP/1.1 200 OK\r\n",
     "content-type: application/x-git-upload-pack-advertisement\r\n",
-    "cache-control: no-cache\r\n",
-    "x-github-request-id: git-v2\r\n",
-    "content-length: 92\r\n",
-    "connection: keep-alive\r\n",
-    "keep-alive: timeout=60\r\n\r\n",
-    "000eversion 2\n0015agent=git/2.45.0\n000cls-refs\n0012fetch=shallow\n0017object-format=sha1\n0000"
+    "content-length: 48\r\n\r\n",
+    "000eversion 2\n000cls-refs\n0012fetch=shallow\n0000"
 )
 .as_bytes();
+
+pub enum GitFastResp {
+    Static(&'static [u8]),
+    Shared(Arc<Vec<u8>>),
+}
 
 #[inline]
 fn write_usize_ascii(out: &mut Vec<u8>, mut n: usize) {
@@ -54,9 +59,9 @@ fn push_http_200(out: &mut Vec<u8>, content_type: &[u8], extra_headers: &[u8], b
     if !extra_headers.is_empty() {
         out.extend_from_slice(extra_headers);
     }
-    out.extend_from_slice(b"x-github-request-id: git-1\r\ncontent-length: ");
+    out.extend_from_slice(b"content-length: ");
     write_usize_ascii(out, body.len());
-    out.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
+    out.extend_from_slice(b"\r\n\r\n");
     out.extend_from_slice(body);
 }
 
@@ -65,9 +70,9 @@ fn push_http_err(out: &mut Vec<u8>, status: &[u8], msg: &[u8]) {
     let body_len = 14 + msg.len();
     out.extend_from_slice(b"HTTP/1.1 ");
     out.extend_from_slice(status);
-    out.extend_from_slice(b"\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: git-err\r\ncontent-length: ");
+    out.extend_from_slice(b"\r\ncontent-type: application/json\r\nx-github-request-id: 1\r\ncontent-length: ");
     write_usize_ascii(out, body_len);
-    out.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n{\"message\":\"");
+    out.extend_from_slice(b"\r\n\r\n{\"message\":\"");
     out.extend_from_slice(msg);
     out.extend_from_slice(b"\"}\n");
 }
@@ -224,7 +229,7 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
 #[inline]
 fn inflate_pack_entry(
     decomp: &mut Decompress,
-    inflate_tmp: &mut [u8],
+    _inflate_tmp: &mut [u8],
     pack: &[u8],
     off: usize,
     expected_size: usize,
@@ -237,15 +242,15 @@ fn inflate_pack_entry(
     decomp.reset(true);
     let mut out = Vec::with_capacity(expected_size.max(64));
     loop {
+        if out.len() == out.capacity() {
+            out.reserve(out.capacity().max(4096));
+        }
         let before_in = decomp.total_in() as usize;
         let before_out = decomp.total_out() as usize;
         let status = decomp
-            .decompress(&slice[before_in..], inflate_tmp, FlushDecompress::None)
+            .decompress_vec(&slice[before_in..], &mut out, FlushDecompress::None)
             .map_err(|_| "zlib inflate error")?;
         let produced = (decomp.total_out() as usize) - before_out;
-        if produced > 0 {
-            out.extend_from_slice(&inflate_tmp[..produced]);
-        }
         match status {
             Status::StreamEnd => {
                 let consumed = decomp.total_in() as usize;
@@ -253,6 +258,10 @@ fn inflate_pack_entry(
             }
             Status::Ok | Status::BufError => {
                 if produced == 0 && (decomp.total_in() as usize) == before_in {
+                    if out.len() == out.capacity() {
+                        out.reserve(4096);
+                        continue;
+                    }
                     return Err("zlib stream stalled");
                 }
             }
@@ -322,11 +331,12 @@ pub fn unpack_packfile(
             pos += 20;
         }
 
+        let zlib_start = pos;
         let (data, next_pos) = inflate_pack_entry(decomp, inflate_tmp, pack, pos, size)?;
         pos = next_pos;
 
         if let Some(kind) = GitObjectKind::from_num(type_num) {
-            let oid = ForgeStore::put_object(repo, kind, data, None);
+            let oid = ForgeStore::put_object(repo, kind, data, Some(pack[zlib_start..next_pos].to_vec()));
             offset_oids.push((entry_offset, oid));
         } else if type_num == 6 {
             let base_off = entry_offset.checked_sub(ofs_dist).ok_or("Invalid OFS_DELTA offset")?;
@@ -375,8 +385,8 @@ pub fn unpack_packfile(
     Ok(())
 }
 
-fn deflate_bytes(data: &[u8]) -> Vec<u8> {
-    let mut comp = Compress::new(Compression::fast(), true);
+fn deflate_bytes(data: &[u8], level: Compression) -> Vec<u8> {
+    let mut comp = Compress::new(level, true);
     let mut out = Vec::with_capacity(data.len() + 32);
     let mut tmp = [0u8; 8192];
     loop {
@@ -396,7 +406,7 @@ fn deflate_bytes(data: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn build_packfile(objects: &[&GitObject]) -> Vec<u8> {
+pub fn build_packfile(objects: &[&GitObject], best_compress: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12 + objects.len() * 128 + 20);
     buf.extend_from_slice(b"PACK");
     buf.extend_from_slice(&2u32.to_be_bytes());
@@ -419,10 +429,19 @@ pub fn build_packfile(objects: &[&GitObject]) -> Vec<u8> {
             }
             buf.push(b);
         }
-        if let Some(ref z) = obj.raw_zlib {
+        if best_compress {
+            let z = deflate_bytes(&obj.data, Compression::best());
+            if let Some(ref raw) = obj.raw_zlib {
+                if raw.len() <= z.len() {
+                    buf.extend_from_slice(raw);
+                    continue;
+                }
+            }
+            buf.extend_from_slice(&z);
+        } else if let Some(ref z) = obj.raw_zlib {
             buf.extend_from_slice(z);
         } else {
-            let z = deflate_bytes(&obj.data);
+            let z = deflate_bytes(&obj.data, Compression::fast());
             buf.extend_from_slice(&z);
         }
     }
@@ -665,17 +684,18 @@ fn collect_fetch_pack(
         .iter()
         .filter_map(|o| repo.objects.get(o))
         .collect();
-    let pack = build_packfile(&objs);
+    let best_compress = haves.is_empty() && client_shallow.is_empty() && objs.len() <= 32;
+    let pack = build_packfile(&objs, best_compress);
     (pack, new_shallow, unshallow)
 }
 
-fn build_receive_refs_http(repo: &Repo, dst: &mut Vec<u8>) {
+fn build_receive_refs_http(repo: &Repo, dst: &mut Vec<u8>) -> usize {
     dst.clear();
     let mut body = [0u8; 512];
     if repo.refs.len() == 1 {
         // Ultra-fast stack-only single-ref builder (zero heap alloc!)
         let (ref_name, oid) = repo.refs.iter().next().unwrap();
-        let caps = b"report-status side-band-64k delete-refs ofs-delta atomic agent=git/2.45.0";
+        let caps = b"report-status side-band-64k delete-refs ofs-delta";
         let line_payload_len = 40 + 1 + ref_name.len() + 1 + caps.len() + 1;
         if 35 + 4 + line_payload_len + 4 <= body.len() {
             let mut p = 0;
@@ -688,6 +708,7 @@ fn build_receive_refs_http(repo: &Repo, dst: &mut Vec<u8>) {
             body[p + 2] = hex[(total >> 4) & 0xf];
             body[p + 3] = hex[total & 0xf];
             p += 4;
+            let body_oid_off = p;
             write_oid_hex(oid, &mut body[p..p + 40]);
             p += 40;
             body[p] = b' ';
@@ -705,16 +726,17 @@ fn build_receive_refs_http(repo: &Repo, dst: &mut Vec<u8>) {
             push_http_200(
                 dst,
                 b"application/x-git-receive-pack-advertisement",
-                b"cache-control: no-cache\r\n",
+                b"",
                 &body[..p],
             );
-            return;
+            let header_len = dst.len() - p;
+            return header_len + body_oid_off;
         }
     }
     let mut pkt_body = Vec::with_capacity(256);
     push_pkt_line(&mut pkt_body, b"# service=git-receive-pack\n");
     pkt_body.extend_from_slice(b"0000");
-    let caps = "report-status side-band-64k delete-refs ofs-delta atomic agent=git/2.45.0";
+    let caps = "report-status side-band-64k delete-refs ofs-delta";
     let mut sorted: Vec<(&String, &Oid)> = repo.refs.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     if sorted.is_empty() {
@@ -734,9 +756,53 @@ fn build_receive_refs_http(repo: &Repo, dst: &mut Vec<u8>) {
     push_http_200(
         dst,
         b"application/x-git-receive-pack-advertisement",
-        b"cache-control: no-cache\r\n",
+        b"",
         &pkt_body,
     );
+    0
+}
+
+// Shared-read L1 fast path for concurrent clones & cached push info/refs (zero copy, RwLock::read only!)
+#[inline]
+pub fn try_handle_git_read_fast(
+    store: &ForgeStore,
+    method: &str,
+    owner: &str,
+    repo_name: &str,
+    rest_path: &str,
+    query: &str,
+    auth: Option<&[u8]>,
+    git_proto: Option<&[u8]>,
+    body: &[u8],
+) -> Option<GitFastResp> {
+    if !store.is_authorized(auth) {
+        return None;
+    }
+    let repo = store.get_repo(owner, repo_name)?;
+    let is_v2 = git_proto
+        .map(|g| g.windows(9).any(|w| w == b"version=2"))
+        .unwrap_or(false);
+    if method == "GET" && rest_path == "/info/refs" {
+        let service = query_param(query, "service").unwrap_or("");
+        if service == "git-upload-pack" && is_v2 {
+            return Some(GitFastResp::Static(UPLOAD_PACK_V2_HTTP));
+        }
+        if service == "git-receive-pack" {
+            if let Some(ref cached) = repo.receive_refs_http_cache {
+                return Some(GitFastResp::Shared(Arc::clone(cached)));
+            }
+        }
+        return None;
+    }
+    if method == "POST" && rest_path == "/git-upload-pack" && is_v2 {
+        if let Some(cached) = repo.fetch_http_cache.get(body) {
+            return Some(GitFastResp::Shared(Arc::clone(cached)));
+        }
+        if let Some(cached) = repo.ls_refs_http_cache.get(body) {
+            return Some(GitFastResp::Shared(Arc::clone(cached)));
+        }
+    }
+    None
 }
 
 pub fn handle_git_request(
@@ -990,9 +1056,9 @@ pub fn handle_git_request(
         };
 
         if cache_kind == 1 && repo.ls_refs_http_cache.len() < 32 {
-            repo.ls_refs_http_cache.insert(body.to_vec(), resp_out.clone());
+            repo.ls_refs_http_cache.insert(body.to_vec(), Arc::new(resp_out.clone()));
         } else if cache_kind == 2 && repo.fetch_http_cache.len() < 32 {
-            repo.fetch_http_cache.insert(body.to_vec(), resp_out.clone());
+            repo.fetch_http_cache.insert(body.to_vec(), Arc::new(resp_out.clone()));
         }
         return;
     }
@@ -1015,8 +1081,11 @@ pub fn handle_git_request(
             }
         }
 
-        let mut cache_buf = repo.receive_refs_http_cache.take().unwrap_or_else(|| Vec::with_capacity(384));
+        let prev_cache = repo.receive_refs_http_cache.take();
+        let prev_oid_off = repo.receive_refs_oid_offset;
         let mut report = Vec::with_capacity(96);
+        let mut single_ok_oid: Option<Oid> = None;
+        let mut any_ref_changed = false;
         if let Some(err_msg) = unpack_err {
             let mut line = [0u8; 128];
             let n = (7 + err_msg.len() + 1).min(line.len());
@@ -1030,7 +1099,8 @@ pub fn handle_git_request(
                 let ng = format!("ng {} unpack failed\n", cmd.ref_name);
                 push_pkt_line(&mut report, ng.as_bytes());
             }
-            repo.receive_refs_http_cache = Some(cache_buf);
+            repo.receive_refs_http_cache = prev_cache;
+            repo.receive_refs_oid_offset = prev_oid_off;
         } else {
             push_pkt_line(&mut report, b"unpack ok\n");
             for cmd in &commands {
@@ -1042,6 +1112,7 @@ pub fn handle_git_request(
                 }
                 if cmd.new_oid == ZERO_OID {
                     ForgeStore::set_ref(repo, cmd.ref_name, None);
+                    any_ref_changed = true;
                     let mut ok_b = [0u8; 256];
                     let rlen = cmd.ref_name.len().min(250);
                     ok_b[..3].copy_from_slice(b"ok ");
@@ -1061,6 +1132,10 @@ pub fn handle_git_request(
                     continue;
                 }
                 ForgeStore::set_ref(repo, cmd.ref_name, Some(cmd.new_oid));
+                any_ref_changed = true;
+                if commands.len() == 1 && cmd.old_oid != ZERO_OID {
+                    single_ok_oid = Some(cmd.new_oid);
+                }
                 let mut ok_b = [0u8; 256];
                 let rlen = cmd.ref_name.len().min(250);
                 ok_b[..3].copy_from_slice(b"ok ");
@@ -1068,15 +1143,31 @@ pub fn handle_git_request(
                 ok_b[3 + rlen] = b'\n';
                 push_pkt_line(&mut report, &ok_b[..4 + rlen]);
             }
-            build_receive_refs_http(repo, &mut cache_buf);
-            repo.receive_refs_http_cache = Some(cache_buf);
+            if let (Some(new_oid), Some(mut arc_buf)) = (single_ok_oid, prev_cache) {
+                if repo.refs.len() == 1 && prev_oid_off > 0 && prev_oid_off + 40 <= arc_buf.len() {
+                    let buf = Arc::make_mut(&mut arc_buf);
+                    write_oid_hex(&new_oid, &mut buf[prev_oid_off..prev_oid_off + 40]);
+                    repo.receive_refs_http_cache = Some(arc_buf);
+                    repo.receive_refs_oid_offset = prev_oid_off;
+                } else {
+                    let mut new_buf = Vec::with_capacity(384);
+                    let off = build_receive_refs_http(repo, &mut new_buf);
+                    repo.receive_refs_http_cache = Some(Arc::new(new_buf));
+                    repo.receive_refs_oid_offset = off;
+                }
+            } else if any_ref_changed || repo.receive_refs_http_cache.is_none() {
+                let mut new_buf = Vec::with_capacity(384);
+                let off = build_receive_refs_http(repo, &mut new_buf);
+                repo.receive_refs_http_cache = Some(Arc::new(new_buf));
+                repo.receive_refs_oid_offset = off;
+            }
         }
         report.extend_from_slice(b"0000");
 
         let sideband_len = 4 + 1 + report.len() + 4;
-        resp_out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-type: application/x-git-receive-pack-result\r\nx-github-request-id: git-1\r\ncontent-length: ");
+        resp_out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-type: application/x-git-receive-pack-result\r\ncontent-length: ");
         write_usize_ascii(resp_out, sideband_len);
-        resp_out.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
+        resp_out.extend_from_slice(b"\r\n\r\n");
         let total = 4 + 1 + report.len();
         let hex = b"0123456789abcdef";
         resp_out.push(hex[(total >> 12) & 0xf]);

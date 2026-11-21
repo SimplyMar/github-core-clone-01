@@ -119,7 +119,7 @@ pub struct Issue {
     pub updated_at: String,
     pub closed_at: Option<String>,
     pub created_seq: u64,
-    pub cached_http_get: Option<Vec<u8>>,
+    pub cached_http_get: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,14 +172,16 @@ pub struct Repo {
     pub pulls: Vec<PullRequest>,
     pub next_issue_number: u64,
     pub next_pull_number: u64,
-    pub receive_refs_http_cache: Option<Vec<u8>>,
-    pub ls_refs_http_cache: FxHashMap<Vec<u8>, Vec<u8>>,
-    pub fetch_http_cache: FxHashMap<Vec<u8>, Vec<u8>>,
+    pub receive_refs_http_cache: Option<Arc<Vec<u8>>>,
+    pub receive_refs_oid_offset: usize,
+    pub ls_refs_http_cache: FxHashMap<Vec<u8>, Arc<Vec<u8>>>,
+    pub fetch_http_cache: FxHashMap<Vec<u8>, Arc<Vec<u8>>>,
 }
 
 impl Repo {
     pub fn invalidate_git_caches(&mut self) {
         self.receive_refs_http_cache = None;
+        self.receive_refs_oid_offset = 0;
         self.ls_refs_http_cache.clear();
         self.fetch_http_cache.clear();
     }
@@ -782,11 +784,12 @@ impl ForgeStore {
             refs: FxHashMap::default(),
             labels: Vec::new(),
             label_index: FxHashMap::default(),
-            issues: Vec::new(),
+            issues: Vec::with_capacity(256),
             pulls: Vec::new(),
             next_issue_number: 1,
             next_pull_number: 1,
             receive_refs_http_cache: None,
+            receive_refs_oid_offset: 0,
             ls_refs_http_cache: FxHashMap::default(),
             fetch_http_cache: FxHashMap::default(),
         };
@@ -849,7 +852,11 @@ impl ForgeStore {
                 repo.refs.remove(ref_name);
             }
             Some(o) => {
-                repo.refs.insert(ref_name.to_string(), o);
+                if let Some(slot) = repo.refs.get_mut(ref_name) {
+                    *slot = o;
+                } else {
+                    repo.refs.insert(ref_name.to_string(), o);
+                }
             }
         }
     }

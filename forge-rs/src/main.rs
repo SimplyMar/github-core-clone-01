@@ -4,24 +4,29 @@ mod mcp;
 mod rest;
 mod store;
 
-use crate::git::handle_git_request;
+use crate::git::{handle_git_request, try_handle_git_read_fast, GitFastResp};
 use crate::graphql::handle_graphql_request;
 use crate::mcp::handle_mcp_request;
-use crate::rest::{handle_rest_request, percent_decode_cow, write_http_json_raw};
+use crate::rest::{
+    handle_rest_request, percent_decode_cow, try_handle_rest_read_fast, write_http_json_raw,
+};
 use crate::store::ForgeStore;
 use flate2::Decompress;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 
 const HEALTHZ_HTTP: &[u8] = concat!(
     "HTTP/1.1 200 OK\r\n",
-    "content-type: application/json; charset=utf-8\r\n",
-    "x-github-request-id: health\r\n",
-    "content-length: 12\r\n",
-    "connection: keep-alive\r\n",
-    "keep-alive: timeout=60\r\n\r\n",
-    "{\"ok\":true}\n"
+    "content-type: application/json\r\n",
+    "x-github-request-id: 1\r\n",
+    "content-length: 11\r\n\r\n",
+    "{\"ok\":true}"
 )
 .as_bytes();
 
@@ -31,12 +36,19 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     if len < 4 {
         return None;
     }
-    let mut i = 0;
-    while i + 3 < len {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return Some(i);
+    let mut i = 3;
+    while i < len {
+        let b = buf[i];
+        if b == b'\n' {
+            if buf[i - 1] == b'\r' && buf[i - 2] == b'\n' && buf[i - 3] == b'\r' {
+                return Some(i - 3);
+            }
+            i += 2;
+        } else if b == b'\r' {
+            i += 1;
+        } else {
+            i += 4;
         }
-        i += 1;
     }
     None
 }
@@ -47,12 +59,19 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     if len < 2 {
         return None;
     }
-    let mut i = 0;
-    while i + 1 < len {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            return Some(i);
+    let mut i = 1;
+    while i < len {
+        let b = buf[i];
+        if b == b'\n' {
+            if buf[i - 1] == b'\r' {
+                return Some(i - 1);
+            }
+            i += 2;
+        } else if b == b'\r' {
+            i += 1;
+        } else {
+            i += 2;
         }
-        i += 1;
     }
     None
 }
@@ -117,19 +136,27 @@ fn parse_git_path(path: &str) -> Option<(Cow<'_, str>, Cow<'_, str>, &str)> {
     Some((percent_decode_cow(owner_raw), percent_decode_cow(repo_raw), sub))
 }
 
+enum DispatchResp {
+    Static(&'static [u8]),
+    Shared(Arc<Vec<u8>>, u64),
+    Buffered,
+}
+
 enum ParseOutcome {
     Incomplete,
     BadRequest,
     Ready {
         consumed: usize,
         keep_alive: bool,
+        resp: DispatchResp,
     },
 }
 
-// Zero-copy HTTP/1.1 request parser + dispatcher into `resp_buf`.
+// Zero-copy HTTP/1.1 parser + shared-read L1 fast path + write-path fallback.
 fn try_process_one_request(
     buf: &[u8],
-    store: &mut ForgeStore,
+    store_lock: &RwLock<ForgeStore>,
+    mutation_gen: &AtomicU64,
     scratch_buf: &mut Vec<u8>,
     decomp: &mut Decompress,
     inflate_tmp: &mut [u8],
@@ -244,342 +271,267 @@ fn try_process_one_request(
         None => &buf[body_start..body_start + content_length],
     };
 
-    resp_buf.clear();
+    // LOCK-FREE FAST PATH: /healthz
     if method_str == "GET" && path_str == "/healthz" {
-        resp_buf.extend_from_slice(HEALTHZ_HTTP);
-    } else if path_str == "/api/v3" || path_str.starts_with("/api/v3/") {
-        handle_rest_request(
-            store,
-            method_str,
-            path_str,
-            query_str,
-            host_str,
-            auth_slice,
-            body_slice,
-            scratch_buf,
-            resp_buf,
-        );
-    } else if path_str == "/api/graphql" {
-        handle_graphql_request(store, auth_slice, body_slice, resp_buf);
-    } else if path_str == "/mcp" {
-        handle_mcp_request(store, auth_slice, body_slice, resp_buf);
-    } else if let Some((owner, repo_name, rest_path)) = parse_git_path(path_str) {
-        handle_git_request(
-            store,
-            method_str,
-            owner.as_ref(),
-            repo_name.as_ref(),
-            rest_path,
-            query_str,
-            auth_slice,
-            git_proto_slice,
-            body_slice,
-            decomp,
-            inflate_tmp,
-            resp_buf,
-        );
-    } else {
-        write_http_json_raw(resp_buf, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
+        return ParseOutcome::Ready {
+            consumed,
+            keep_alive,
+            resp: DispatchResp::Static(HEALTHZ_HTTP),
+        };
     }
 
-    ParseOutcome::Ready { consumed, keep_alive }
+    // SHARED-READ L1 FAST PATHS (RwLock::read only, zero byte copy, full 2-CPU parallelism!)
+    if method_str == "GET" && path_str.starts_with("/api/v3/repos/") {
+        let guard = store_lock.read().unwrap();
+        if let Some(cached) = try_handle_rest_read_fast(&guard, method_str, path_str, auth_slice) {
+            let gen_now = mutation_gen.load(Ordering::Acquire);
+            return ParseOutcome::Ready {
+                consumed,
+                keep_alive,
+                resp: DispatchResp::Shared(cached, gen_now),
+            };
+        }
+    } else if !path_str.starts_with("/api/") && path_str != "/mcp" {
+        if let Some((owner, repo_name, rest_path)) = parse_git_path(path_str) {
+            if (method_str == "GET" && rest_path == "/info/refs")
+                || (method_str == "POST" && rest_path == "/git-upload-pack")
+            {
+                let guard = store_lock.read().unwrap();
+                if let Some(fast) = try_handle_git_read_fast(
+                    &guard,
+                    method_str,
+                    owner.as_ref(),
+                    repo_name.as_ref(),
+                    rest_path,
+                    query_str,
+                    auth_slice,
+                    git_proto_slice,
+                    body_slice,
+                ) {
+                    let gen_now = mutation_gen.load(Ordering::Acquire);
+                    let resp = match fast {
+                        GitFastResp::Static(s) => DispatchResp::Static(s),
+                        GitFastResp::Shared(a) => DispatchResp::Shared(a, gen_now),
+                    };
+                    return ParseOutcome::Ready {
+                        consumed,
+                        keep_alive,
+                        resp,
+                    };
+                }
+            }
+            // Write-lock fallback for git request (already parsed git path)
+            resp_buf.clear();
+            {
+                let mut guard = store_lock.write().unwrap();
+                handle_git_request(
+                    &mut guard,
+                    method_str,
+                    owner.as_ref(),
+                    repo_name.as_ref(),
+                    rest_path,
+                    query_str,
+                    auth_slice,
+                    git_proto_slice,
+                    body_slice,
+                    decomp,
+                    inflate_tmp,
+                    resp_buf,
+                );
+                if rest_path == "/git-receive-pack" {
+                    mutation_gen.fetch_add(1, Ordering::Release);
+                }
+            }
+            return ParseOutcome::Ready {
+                consumed,
+                keep_alive,
+                resp: DispatchResp::Buffered,
+            };
+        }
+    }
+
+    // WRITE-LOCK PATH for REST / GraphQL / MCP / cache-miss / 404
+    resp_buf.clear();
+    {
+        let mut guard = store_lock.write().unwrap();
+        if path_str == "/api/v3" || path_str.starts_with("/api/v3/") {
+            handle_rest_request(
+                &mut guard,
+                method_str,
+                path_str,
+                query_str,
+                host_str,
+                auth_slice,
+                body_slice,
+                scratch_buf,
+                resp_buf,
+            );
+            if method_str != "GET" && method_str != "HEAD" {
+                mutation_gen.fetch_add(1, Ordering::Release);
+            }
+        } else if path_str == "/api/graphql" {
+            handle_graphql_request(&mut guard, auth_slice, body_slice, resp_buf);
+            mutation_gen.fetch_add(1, Ordering::Release);
+        } else if path_str == "/mcp" {
+            handle_mcp_request(&mut guard, auth_slice, body_slice, resp_buf);
+            mutation_gen.fetch_add(1, Ordering::Release);
+        } else {
+            write_http_json_raw(resp_buf, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
+        }
+    }
+
+    ParseOutcome::Ready {
+        consumed,
+        keep_alive,
+        resp: DispatchResp::Buffered,
+    }
 }
 
-// =========================================================================
-// LINUX: Single-Threaded Zero-Lock Raw Epoll Reactor (0 threads, 0 locks!)
-// =========================================================================
-#[cfg(target_os = "linux")]
-fn run_server(listener: TcpListener) {
-    use std::io::ErrorKind;
-    use std::net::TcpStream;
-    use std::os::fd::{AsRawFd, RawFd};
-
-    struct Conn {
-        stream: TcpStream,
-        read_buf: Vec<u8>,
-        filled: usize,
-        write_buf: Vec<u8>,
-        write_pos: usize,
-        want_out: bool,
-        close_after_write: bool,
-    }
-
-    listener.set_nonblocking(true).expect("set_nonblocking");
-    let listen_fd = listener.as_raw_fd();
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    assert!(epfd >= 0, "epoll_create1 failed");
-
-    let mut lev = libc::epoll_event {
-        events: libc::EPOLLIN as u32,
-        u64: listen_fd as u64,
-    };
-    unsafe {
-        libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, listen_fd, &mut lev);
-    }
-
-    let mut store = ForgeStore::new();
-    // O(1) direct FD table — zero hashing!
-    let mut conns: Vec<Option<Conn>> = (0..256).map(|_| None).collect();
-    let mut resp_buf = Vec::with_capacity(65536);
-    let mut scratch_buf = Vec::with_capacity(4096);
-    let mut decomp = Decompress::new(true);
-    let mut inflate_tmp = vec![0u8; 16384];
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 128];
+fn handle_connection(
+    mut stream: TcpStream,
+    store: &RwLock<ForgeStore>,
+    mutation_gen: &AtomicU64,
+    read_buf: &mut Vec<u8>,
+    resp_buf: &mut Vec<u8>,
+    scratch_buf: &mut Vec<u8>,
+    decomp: &mut Decompress,
+    inflate_tmp: &mut [u8],
+) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1200)));
+    let mut filled = 0usize;
+    // Per-connection L0 exact-request read cache (invalidated by global mutation_gen)
+    let mut last_req: Vec<u8> = Vec::new();
+    let mut last_gen: u64 = 0;
+    let mut last_resp: Option<Arc<Vec<u8>>> = None;
 
     loop {
-        let nfds = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as i32, -1) };
-        if nfds < 0 {
-            continue;
+        if filled == read_buf.len() {
+            read_buf.resize((read_buf.len() * 2).max(16384), 0);
         }
-        for i in 0..(nfds as usize) {
-            let fd = events[i].u64 as RawFd;
-            let ev_flags = events[i].events;
-
-            if fd == listen_fd {
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let _ = stream.set_nonblocking(true);
-                            let _ = stream.set_nodelay(true);
-                            let cfd = stream.as_raw_fd();
-                            let idx = cfd as usize;
-                            if idx >= conns.len() {
-                                conns.resize_with(idx + 64, || None);
-                            }
-                            let mut cev = libc::epoll_event {
-                                events: libc::EPOLLIN as u32,
-                                u64: cfd as u64,
-                            };
-                            unsafe {
-                                libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, cfd, &mut cev);
-                            }
-                            conns[idx] = Some(Conn {
-                                stream,
-                                read_buf: vec![0u8; 8192],
-                                filled: 0,
-                                write_buf: Vec::new(),
-                                write_pos: 0,
-                                want_out: false,
-                                close_after_write: false,
-                            });
-                        }
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
+        match stream.read(&mut read_buf[filled..]) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => filled += n,
+        }
+        // L0 ultra-fast path: identical read-only request on keep-alive connection with zero mutations
+        if let Some(ref cached) = last_resp {
+            if filled == last_req.len()
+                && read_buf[..filled] == last_req[..]
+                && mutation_gen.load(Ordering::Acquire) == last_gen
+            {
+                if stream.write_all(cached).is_err() {
+                    return;
                 }
+                filled = 0;
                 continue;
             }
-
-            let idx = fd as usize;
-            if idx >= conns.len() {
-                continue;
-            }
-            let mut drop_conn = (ev_flags & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32)) != 0
-                && (ev_flags & libc::EPOLLIN as u32) == 0;
-
-            if !drop_conn {
-                if let Some(conn) = conns[idx].as_mut() {
-                    if conn.write_pos < conn.write_buf.len() {
-                        while conn.write_pos < conn.write_buf.len() {
-                            match conn.stream.write(&conn.write_buf[conn.write_pos..]) {
-                                Ok(0) => {
-                                    drop_conn = true;
-                                    break;
-                                }
-                                Ok(n) => conn.write_pos += n,
-                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                                Err(_) => {
-                                    drop_conn = true;
-                                    break;
-                                }
+        }
+        while filled > 0 {
+            match try_process_one_request(
+                &read_buf[..filled],
+                store,
+                mutation_gen,
+                scratch_buf,
+                decomp,
+                inflate_tmp,
+                resp_buf,
+            ) {
+                ParseOutcome::Incomplete => break,
+                ParseOutcome::BadRequest => return,
+                ParseOutcome::Ready {
+                    consumed,
+                    keep_alive,
+                    resp,
+                } => {
+                    let write_res = match resp {
+                        DispatchResp::Static(s) => stream.write_all(s),
+                        DispatchResp::Shared(a, gen_now) => {
+                            let r = stream.write_all(&a);
+                            if keep_alive && consumed <= 1024 {
+                                last_req.clear();
+                                last_req.extend_from_slice(&read_buf[..consumed]);
+                                last_gen = gen_now;
+                                last_resp = Some(a);
                             }
+                            r
                         }
-                        if !drop_conn && conn.write_pos >= conn.write_buf.len() {
-                            conn.write_buf.clear();
-                            conn.write_pos = 0;
-                            if conn.close_after_write {
-                                drop_conn = true;
-                            } else if conn.want_out {
-                                conn.want_out = false;
-                                let mut cev = libc::epoll_event {
-                                    events: libc::EPOLLIN as u32,
-                                    u64: fd as u64,
-                                };
-                                unsafe {
-                                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut cev);
-                                }
-                            }
-                        }
+                        DispatchResp::Buffered => stream.write_all(resp_buf),
+                    };
+                    if write_res.is_err() {
+                        return;
                     }
-
-                    if !drop_conn && conn.write_pos >= conn.write_buf.len() && (ev_flags & libc::EPOLLIN as u32) != 0 {
-                        let mut peer_eof = false;
-                        loop {
-                            if conn.filled == conn.read_buf.len() {
-                                let new_len = (conn.read_buf.len() * 2).max(16384);
-                                conn.read_buf.resize(new_len, 0);
-                            }
-                            match conn.stream.read(&mut conn.read_buf[conn.filled..]) {
-                                Ok(0) => {
-                                    peer_eof = true;
-                                    break;
-                                }
-                                Ok(n) => {
-                                    conn.filled += n;
-                                    if conn.filled < conn.read_buf.len() {
-                                        break;
-                                    }
-                                }
-                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                                Err(_) => {
-                                    drop_conn = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        while !drop_conn && conn.filled > 0 && conn.write_buf.is_empty() {
-                            match try_process_one_request(
-                                &conn.read_buf[..conn.filled],
-                                &mut store,
-                                &mut scratch_buf,
-                                &mut decomp,
-                                &mut inflate_tmp,
-                                &mut resp_buf,
-                            ) {
-                                ParseOutcome::Incomplete => break,
-                                ParseOutcome::BadRequest => {
-                                    drop_conn = true;
-                                    break;
-                                }
-                                ParseOutcome::Ready { consumed, keep_alive } => {
-                                    if consumed >= conn.filled {
-                                        conn.filled = 0;
-                                    } else {
-                                        let rem = conn.filled - consumed;
-                                        conn.read_buf.copy_within(consumed..conn.filled, 0);
-                                        conn.filled = rem;
-                                    }
-
-                                    let mut written = 0;
-                                    while written < resp_buf.len() {
-                                        match conn.stream.write(&resp_buf[written..]) {
-                                            Ok(0) => {
-                                                drop_conn = true;
-                                                break;
-                                            }
-                                            Ok(n) => written += n,
-                                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                                conn.write_buf.extend_from_slice(&resp_buf[written..]);
-                                                conn.write_pos = 0;
-                                                conn.close_after_write = !keep_alive || peer_eof;
-                                                if !conn.want_out {
-                                                    conn.want_out = true;
-                                                    let mut cev = libc::epoll_event {
-                                                        events: (libc::EPOLLIN | libc::EPOLLOUT) as u32,
-                                                        u64: fd as u64,
-                                                    };
-                                                    unsafe {
-                                                        libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut cev);
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                                            Err(_) => {
-                                                drop_conn = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if !keep_alive && conn.write_buf.is_empty() {
-                                        drop_conn = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        if peer_eof && conn.write_buf.is_empty() {
-                            drop_conn = true;
-                        }
+                    if consumed >= filled {
+                        filled = 0;
+                    } else {
+                        let rem = filled - consumed;
+                        read_buf.copy_within(consumed..filled, 0);
+                        filled = rem;
+                    }
+                    if !keep_alive {
+                        return;
                     }
                 }
-            }
-
-            if drop_conn {
-                unsafe {
-                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
-                }
-                conns[idx] = None;
             }
         }
     }
 }
 
 // =========================================================================
-// NON-LINUX (Windows local testing): Simple threaded server using same parser
+// Pre-spawned Blocking Worker Pool + RwLock Shared-Read Fast Paths + L0 Cache
+// (2 syscalls/req on gVisor — no epoll_wait/epoll_ctl/FIONBIO overhead,
+//  plus full 2-CPU parallel execution for 50 concurrent clones!)
 // =========================================================================
-#[cfg(not(target_os = "linux"))]
 fn run_server(listener: TcpListener) {
-    use std::sync::{Arc, Mutex};
-    use std::thread;
+    const WORKER_COUNT: usize = 128;
+    let store = Arc::new(RwLock::new(ForgeStore::new()));
+    let mutation_gen = Arc::new(AtomicU64::new(0));
+    let queue: Arc<(Mutex<VecDeque<TcpStream>>, Condvar)> =
+        Arc::new((Mutex::new(VecDeque::with_capacity(256)), Condvar::new()));
 
-    let store = Arc::new(Mutex::new(ForgeStore::new()));
-    for conn in listener.incoming() {
-        let Ok(mut stream) = conn else { continue };
+    for _ in 0..WORKER_COUNT {
         let st = Arc::clone(&store);
-        thread::spawn(move || {
-            let _ = stream.set_nodelay(true);
-            let mut read_buf = vec![0u8; 8192];
-            let mut filled = 0usize;
+        let mg = Arc::clone(&mutation_gen);
+        let q = Arc::clone(&queue);
+        let _ = thread::Builder::new().stack_size(128 * 1024).spawn(move || {
+            let mut read_buf = vec![0u8; 16384];
             let mut resp_buf = Vec::with_capacity(65536);
             let mut scratch_buf = Vec::with_capacity(4096);
             let mut decomp = Decompress::new(true);
-            let mut inflate_tmp = vec![0u8; 16384];
+            let mut inflate_tmp = vec![0u8; 4096];
             loop {
-                if filled == read_buf.len() {
-                    read_buf.resize(read_buf.len() * 2, 0);
-                }
-                match stream.read(&mut read_buf[filled..]) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => filled += n,
-                }
-                loop {
-                    let outcome = {
-                        let mut guard = st.lock().unwrap();
-                        try_process_one_request(
-                            &read_buf[..filled],
-                            &mut guard,
-                            &mut scratch_buf,
-                            &mut decomp,
-                            &mut inflate_tmp,
-                            &mut resp_buf,
-                        )
-                    };
-                    match outcome {
-                        ParseOutcome::Incomplete => break,
-                        ParseOutcome::BadRequest => return,
-                        ParseOutcome::Ready { consumed, keep_alive } => {
-                            if stream.write_all(&resp_buf).is_err() {
-                                return;
-                            }
-                            if consumed >= filled {
-                                filled = 0;
-                            } else {
-                                let rem = filled - consumed;
-                                read_buf.copy_within(consumed..filled, 0);
-                                filled = rem;
-                            }
-                            if !keep_alive {
-                                return;
-                            }
-                        }
+                let stream = {
+                    let (lock, cvar) = &*q;
+                    let mut guard = lock.lock().unwrap();
+                    while guard.is_empty() {
+                        guard = cvar.wait(guard).unwrap();
                     }
+                    guard.pop_front().unwrap()
+                };
+                handle_connection(
+                    stream,
+                    &st,
+                    &mg,
+                    &mut read_buf,
+                    &mut resp_buf,
+                    &mut scratch_buf,
+                    &mut decomp,
+                    &mut inflate_tmp,
+                );
+                if read_buf.len() > 262_144 {
+                    read_buf.truncate(16384);
+                    read_buf.shrink_to_fit();
                 }
             }
         });
+    }
+
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        let (lock, cvar) = &*queue;
+        let mut guard = lock.lock().unwrap();
+        guard.push_back(stream);
+        drop(guard);
+        cvar.notify_one();
     }
 }
 
