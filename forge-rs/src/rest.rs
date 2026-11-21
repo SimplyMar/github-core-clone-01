@@ -4,7 +4,7 @@ use crate::store::{
 };
 use rustc_hash::FxHashMap;
 use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
+use std::borrow::Cow;
 
 #[inline]
 pub fn write_json_str(out: &mut Vec<u8>, s: &str) {
@@ -132,7 +132,7 @@ pub fn build_issue_http_200(issue: &Issue) -> Vec<u8> {
         b"HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: r1\r\ncontent-length: ",
     );
     write_u64(&mut resp, body.len() as u64);
-    resp.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n");
+    resp.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
     resp.extend_from_slice(&body);
     resp
 }
@@ -233,7 +233,7 @@ pub fn write_http_json_raw(out: &mut Vec<u8>, status: &str, extra_headers: &str,
     }
     out.extend_from_slice(b"content-length: ");
     write_u64(out, body_bytes.len() as u64);
-    out.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n");
+    out.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
     out.extend_from_slice(body_bytes);
 }
 
@@ -249,6 +249,13 @@ pub fn write_http_204(out: &mut Vec<u8>) {
     out.extend_from_slice(
         b"HTTP/1.1 204 No Content\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: r1\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n",
     );
+}
+
+pub fn percent_decode_cow<'a>(s: &'a str) -> Cow<'a, str> {
+    if !s.as_bytes().contains(&b'%') {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(percent_decode(s))
 }
 
 pub fn percent_decode(s: &str) -> String {
@@ -293,17 +300,115 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<String> {
     None
 }
 
+// Fast zero-alloc JSON extractor for simple {"title":"...","body":"..."} objects (no labels / no \u escapes)
+fn fast_parse_issue_create(raw: &[u8]) -> Option<(String, String)> {
+    let mut i = 0;
+    let len = raw.len();
+    while i < len && raw[i].is_ascii_whitespace() { i += 1; }
+    if i >= len || raw[i] != b'{' { return None; }
+    i += 1;
+    let mut title: Option<String> = None;
+    let mut body: Option<String> = None;
+    loop {
+        while i < len && raw[i].is_ascii_whitespace() { i += 1; }
+        if i >= len { return None; }
+        if raw[i] == b'}' {
+            i += 1;
+            while i < len && raw[i].is_ascii_whitespace() { i += 1; }
+            if i != len { return None; }
+            return Some((title.unwrap_or_default(), body.unwrap_or_default()));
+        }
+        if raw[i] != b'"' { return None; }
+        let (key, next_i) = parse_simple_json_str(raw, i)?;
+        i = next_i;
+        while i < len && raw[i].is_ascii_whitespace() { i += 1; }
+        if i >= len || raw[i] != b':' { return None; }
+        i += 1;
+        while i < len && raw[i].is_ascii_whitespace() { i += 1; }
+        if i >= len || raw[i] != b'"' { return None; }
+        let (val, next_i) = parse_simple_json_str(raw, i)?;
+        i = next_i;
+        if key == "title" {
+            title = Some(val);
+        } else if key == "body" {
+            body = Some(val);
+        } else {
+            return None;
+        }
+        while i < len && raw[i].is_ascii_whitespace() { i += 1; }
+        if i < len && raw[i] == b',' {
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn parse_simple_json_str(raw: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut i = start + 1;
+    let len = raw.len();
+    let mut has_escape = false;
+    let content_start = i;
+    while i < len {
+        let b = raw[i];
+        if b == b'"' {
+            if !has_escape {
+                let s = std::str::from_utf8(&raw[content_start..i]).ok()?;
+                return Some((s.to_string(), i + 1));
+            }
+            break;
+        }
+        if b == b'\\' {
+            has_escape = true;
+            if i + 1 >= len || raw[i + 1] == b'u' {
+                return None;
+            }
+            i += 2;
+            continue;
+        }
+        if b < 0x20 {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= len || raw[i] != b'"' {
+        return None;
+    }
+    let mut out = Vec::with_capacity(i - content_start);
+    let mut j = content_start;
+    while j < i {
+        if raw[j] == b'\\' {
+            j += 1;
+            match raw[j] {
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'/' => out.push(b'/'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0c),
+                _ => return None,
+            }
+        } else {
+            out.push(raw[j]);
+        }
+        j += 1;
+    }
+    Some((String::from_utf8(out).ok()?, i + 1))
+}
+
 pub fn handle_rest_request(
-    store_lock: &RwLock<ForgeStore>,
+    store: &mut ForgeStore,
     method: &str,
     path: &str,
     query: &str,
     host: &str,
     auth: Option<&[u8]>,
     raw_body: &[u8],
+    scratch_body: &mut Vec<u8>,
     resp_out: &mut Vec<u8>,
-) -> Option<Arc<Vec<u8>>> {
-    // ULTRA-FAST PATH 1: GET /api/v3/repos/{owner}/{repo}/issues/{number}
+) {
+    // ULTRA-FAST PATH 1: GET /api/v3/repos/{owner}/{repo}/issues/{number} (ZERO ALLOCATIONS, ZERO LOCKS!)
     if method == "GET" && path.starts_with("/api/v3/repos/") {
         let tail = &path[14..];
         let mut parts = tail.split('/');
@@ -311,43 +416,34 @@ pub fn handle_rest_request(
             (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
         {
             if let Ok(num) = num_str.parse::<u64>() {
-                let owner = if o_raw.contains('%') { percent_decode(o_raw) } else { o_raw.to_string() };
-                let repo_name = if r_raw.contains('%') { percent_decode(r_raw) } else { r_raw.to_string() };
-                {
-                    let store = store_lock.read().unwrap();
-                    if !store.is_authorized(auth) {
-                        write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
-                        return None;
-                    }
-                    let repo = match store.get_repo(&owner, &repo_name) {
-                        Some(r) => r,
-                        None => {
-                            write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                            return None;
-                        }
-                    };
-                    let issue = match repo.get_issue(num) {
-                        Some(i) => i,
-                        None => {
-                            write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                            return None;
-                        }
-                    };
-                    if let Some(ref cached) = issue.cached_http_get {
-                        return Some(Arc::clone(cached));
-                    }
+                if !store.is_authorized(auth) {
+                    write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
+                    return;
                 }
-                // Cache miss: build & store once under write lock!
-                let mut store = store_lock.write().unwrap();
-                if let Some(repo) = store.get_repo_mut(&owner, &repo_name) {
-                    if let Some(issue) = repo.get_issue_mut(num) {
-                        let built = Arc::new(build_issue_http_200(issue));
-                        issue.cached_http_get = Some(Arc::clone(&built));
-                        return Some(built);
+                let owner = percent_decode_cow(o_raw);
+                let repo_name = percent_decode_cow(r_raw);
+                let repo = match store.get_repo_mut(owner.as_ref(), repo_name.as_ref()) {
+                    Some(r) => r,
+                    None => {
+                        write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
+                        return;
                     }
+                };
+                let issue = match repo.get_issue_mut(num) {
+                    Some(i) => i,
+                    None => {
+                        write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
+                        return;
+                    }
+                };
+                if let Some(ref cached) = issue.cached_http_get {
+                    resp_out.extend_from_slice(cached);
+                    return;
                 }
-                write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                return None;
+                let built = build_issue_http_200(issue);
+                resp_out.extend_from_slice(&built);
+                issue.cached_http_get = Some(built);
+                return;
             }
         }
     }
@@ -359,12 +455,32 @@ pub fn handle_rest_request(
         if let (Some(o_raw), Some(r_raw), Some("issues"), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         {
-            let owner = if o_raw.contains('%') { percent_decode(o_raw) } else { o_raw.to_string() };
-            let repo_name = if r_raw.contains('%') { percent_decode(r_raw) } else { r_raw.to_string() };
-            let mut store = store_lock.write().unwrap();
             if !store.is_authorized(auth) {
                 write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
-                return None;
+                return;
+            }
+            let owner = percent_decode_cow(o_raw);
+            let repo_name = percent_decode_cow(r_raw);
+            let repo_idx = match store.get_repo_idx(owner.as_ref(), repo_name.as_ref()) {
+                Some(i) => i,
+                None => {
+                    write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
+                    return;
+                }
+            };
+            if let Some((title, body_s)) = fast_parse_issue_create(raw_body) {
+                if title.is_empty() {
+                    write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"Title is required\"}\n");
+                    return;
+                }
+                if let Ok(num) = store.create_issue(repo_idx, title, body_s, &[]) {
+                    let issue = store.repos[repo_idx].get_issue(num).unwrap();
+                    scratch_body.clear();
+                    write_issue_json(scratch_body, issue);
+                    scratch_body.push(b'\n');
+                    write_http_json_raw(resp_out, "201 Created", "", scratch_body);
+                }
+                return;
             }
             let val: Value = if raw_body.is_empty() {
                 json!({})
@@ -373,25 +489,18 @@ pub fn handle_rest_request(
                     Ok(v) if v.is_object() => v,
                     Ok(_) => {
                         write_http_json_raw(resp_out, "400 Bad Request", "", b"{\"message\":\"Body should be a JSON object\"}\n");
-                        return None;
+                        return;
                     }
                     Err(_) => {
                         write_http_json_raw(resp_out, "400 Bad Request", "", b"{\"message\":\"Problems parsing JSON\"}\n");
-                        return None;
+                        return;
                     }
-                }
-            };
-            let repo_idx = match store.get_repo_idx(&owner, &repo_name) {
-                Some(i) => i,
-                None => {
-                    write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                    return None;
                 }
             };
             let title = val.get("title").and_then(|v| v.as_str()).unwrap_or("");
             if title.is_empty() {
                 write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"Title is required\"}\n");
-                return None;
+                return;
             }
             let body_s = val.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let labels: Vec<String> = val
@@ -402,16 +511,16 @@ pub fn handle_rest_request(
             match store.create_issue(repo_idx, title.to_string(), body_s, &labels) {
                 Ok(num) => {
                     let issue = store.repos[repo_idx].get_issue(num).unwrap();
-                    let mut json_body = Vec::with_capacity(384 + issue.title.len() + issue.body.len());
-                    write_issue_json(&mut json_body, issue);
-                    json_body.push(b'\n');
-                    write_http_json_raw(resp_out, "201 Created", "", &json_body);
+                    scratch_body.clear();
+                    write_issue_json(scratch_body, issue);
+                    scratch_body.push(b'\n');
+                    write_http_json_raw(resp_out, "201 Created", "", scratch_body);
                 }
                 Err(bad) => {
                     write_http_json(resp_out, "422 Unprocessable Entity", "", &json!({ "message": format!("Label {} does not exist", bad) }));
                 }
             }
-            return None;
+            return;
         }
     }
 
@@ -422,7 +531,7 @@ pub fn handle_rest_request(
             "x-oauth-scopes: repo, read:org\r\n",
             b"{\"current_user_url\":\"/api/v3/user\",\"rate_limit_url\":\"/api/v3/rate_limit\"}\n",
         );
-        return None;
+        return;
     }
 
     if method == "GET" && path == "/api/v3/meta" {
@@ -432,44 +541,33 @@ pub fn handle_rest_request(
             "",
             b"{\"installed_version\":\"3.15.0\",\"verifiable_password_authentication\":false}\n",
         );
-        return None;
+        return;
+    }
+
+    if !store.is_authorized(auth) {
+        write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
+        return;
     }
 
     let body: Value = if !raw_body.is_empty() && method != "GET" && method != "HEAD" {
         match serde_json::from_slice::<Value>(raw_body) {
             Ok(v) if v.is_object() => v,
             Ok(_) => {
-                let store = store_lock.read().unwrap();
-                if !store.is_authorized(auth) {
-                    write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
-                    return None;
-                }
                 write_http_json_raw(resp_out, "400 Bad Request", "", b"{\"message\":\"Body should be a JSON object\"}\n");
-                return None;
+                return;
             }
             Err(_) => {
-                let store = store_lock.read().unwrap();
-                if !store.is_authorized(auth) {
-                    write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
-                    return None;
-                }
                 write_http_json_raw(resp_out, "400 Bad Request", "", b"{\"message\":\"Problems parsing JSON\"}\n");
-                return None;
+                return;
             }
         }
     } else {
         json!({})
     };
 
-    let mut store = store_lock.write().unwrap();
-    if !store.is_authorized(auth) {
-        write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
-        return None;
-    }
-
     if method == "GET" && path == "/api/v3/user" {
         write_http_json(resp_out, "200 OK", "", &format_user_val(&store.viewer));
-        return None;
+        return;
     }
 
     if path == "/api/v3/user/repos" {
@@ -493,17 +591,17 @@ pub fn handle_rest_request(
                 String::new()
             };
             write_http_json(resp_out, "200 OK", &extra, &Value::Array(slice.to_vec()));
-            return None;
+            return;
         }
         if method == "POST" {
             let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             if name.is_empty() {
                 write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"Repository name is required\"}\n");
-                return None;
+                return;
             }
             if store.repo_by_name.contains_key(&name) {
                 write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"Repository already exists\"}\n");
-                return None;
+                return;
             }
             let desc = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let priv_flag = body.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -516,7 +614,7 @@ pub fn handle_rest_request(
             let has_issues = body.get("has_issues").and_then(|v| v.as_bool()).unwrap_or(true);
             let idx = store.create_repo(name, desc, priv_flag, def_br, has_issues);
             write_http_json(resp_out, "201 Created", "", &format_repo_val(&store.repos[idx]));
-            return None;
+            return;
         }
     }
 
@@ -524,7 +622,7 @@ pub fn handle_rest_request(
         Some(r) => r,
         None => {
             write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-            return None;
+            return;
         }
     };
     let mut segs = rest_after_repos.splitn(3, '/');
@@ -532,14 +630,14 @@ pub fn handle_rest_request(
         Some(s) if !s.is_empty() => percent_decode(s),
         _ => {
             write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-            return None;
+            return;
         }
     };
     let repo_name = match segs.next() {
         Some(s) if !s.is_empty() => percent_decode(s),
         _ => {
             write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-            return None;
+            return;
         }
     };
     let sub_path = segs.next().unwrap_or("");
@@ -547,7 +645,7 @@ pub fn handle_rest_request(
         Some(i) => i,
         None => {
             write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-            return None;
+            return;
         }
     };
 
@@ -555,7 +653,7 @@ pub fn handle_rest_request(
         match method {
             "GET" => {
                 write_http_json(resp_out, "200 OK", "", &format_repo_val(&store.repos[repo_idx]));
-                return None;
+                return;
             }
             "PATCH" => {
                 let ts = store.next_timestamp();
@@ -576,12 +674,12 @@ pub fn handle_rest_request(
                 }
                 repo.updated_at = ts;
                 write_http_json(resp_out, "200 OK", "", &format_repo_val(&store.repos[repo_idx]));
-                return None;
+                return;
             }
             "DELETE" => {
                 store.delete_repo(&owner, &repo_name);
                 write_http_204(resp_out);
-                return None;
+                return;
             }
             _ => {}
         }
@@ -593,7 +691,7 @@ pub fn handle_rest_request(
         let oid = crate::store::hex_to_oid(sha_s.as_bytes());
         if r.is_empty() || oid.is_none() || !store.repos[repo_idx].objects.contains_key(&oid.unwrap()) {
             write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"Invalid ref or sha\"}\n");
-            return None;
+            return;
         }
         let full_ref = if r.starts_with("refs/") {
             r.to_string()
@@ -608,7 +706,7 @@ pub fn handle_rest_request(
             "",
             &json!({ "ref": full_ref, "object": { "type": "commit", "sha": oid_to_hex(&oid) } }),
         );
-        return None;
+        return;
     }
 
     if sub_path == "branches" && method == "GET" {
@@ -620,7 +718,7 @@ pub fn handle_rest_request(
             }
         }
         write_http_json(resp_out, "200 OK", "", &Value::Array(branches));
-        return None;
+        return;
     }
 
     if sub_path == "commits" && method == "GET" {
@@ -630,7 +728,7 @@ pub fn handle_rest_request(
             Some(t) => t,
             None => {
                 write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                return None;
+                return;
             }
         };
         let per_page = query_param(query, "per_page")
@@ -663,7 +761,7 @@ pub fn handle_rest_request(
             cur = next_p;
         }
         write_http_json(resp_out, "200 OK", "", &Value::Array(list));
-        return None;
+        return;
     }
 
     if sub_path == "contents" || sub_path.starts_with("contents/") {
@@ -680,7 +778,7 @@ pub fn handle_rest_request(
                 Some(t) => t,
                 None => {
                     write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                    return None;
+                    return;
                 }
             };
             if file_path.is_empty() {
@@ -688,7 +786,7 @@ pub fn handle_rest_request(
                     Some(o) => o,
                     None => {
                         write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                        return None;
+                        return;
                     }
                 };
                 let items: Vec<Value> = parse_tree(&tree_obj.data)
@@ -706,7 +804,7 @@ pub fn handle_rest_request(
                     })
                     .collect();
                 write_http_json(resp_out, "200 OK", "", &Value::Array(items));
-                return None;
+                return;
             }
             let parts: Vec<&str> = file_path.split('/').collect();
             let mut cur_tree = tree_oid;
@@ -715,14 +813,14 @@ pub fn handle_rest_request(
                     Some(o) if o.kind == GitObjectKind::Tree => o,
                     _ => {
                         write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                        return None;
+                        return;
                     }
                 };
                 let entry = match parse_tree(&obj.data).into_iter().find(|e| e.name == part) {
                     Some(e) => e,
                     None => {
                         write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                        return None;
+                        return;
                     }
                 };
                 let is_dir = entry.mode == "40000" || entry.mode == "040000";
@@ -749,13 +847,13 @@ pub fn handle_rest_request(
                             })
                             .unwrap_or_default();
                         write_http_json(resp_out, "200 OK", "", &Value::Array(items));
-                        return None;
+                        return;
                     }
                     let blob = match repo.objects.get(&entry.oid) {
                         Some(b) => b,
                         None => {
                             write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                            return None;
+                            return;
                         }
                     };
                     write_http_json(
@@ -772,11 +870,11 @@ pub fn handle_rest_request(
                             "content": base64_encode(&blob.data),
                         }),
                     );
-                    return None;
+                    return;
                 }
                 if !is_dir {
                     write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                    return None;
+                    return;
                 }
                 cur_tree = entry.oid;
             }
@@ -811,7 +909,7 @@ pub fn handle_rest_request(
                         "",
                         &json!({ "message": format!("{} does not match {}", file_path, provided_sha.unwrap_or("none")) }),
                     );
-                    return None;
+                    return;
                 }
             }
             let raw_buf = base64_decode(content_b64.as_bytes());
@@ -836,7 +934,7 @@ pub fn handle_rest_request(
                     "commit": { "sha": oid_to_hex(&commit_sha), "message": message },
                 }),
             );
-            return None;
+            return;
         }
         if method == "DELETE" {
             let branch = body
@@ -862,7 +960,7 @@ pub fn handle_rest_request(
                 Some(o) => o,
                 None => {
                     write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                    return None;
+                    return;
                 }
             };
             if let Some(ps) = provided_sha {
@@ -873,7 +971,7 @@ pub fn handle_rest_request(
                         "",
                         &json!({ "message": format!("{} does not match {}", file_path, ps) }),
                     );
-                    return None;
+                    return;
                 }
             }
             let (commit_sha, _) = store.commit_file_change(repo_idx, &branch, &file_path, None, &message);
@@ -883,7 +981,7 @@ pub fn handle_rest_request(
                 "",
                 &json!({ "content": null, "commit": { "sha": oid_to_hex(&commit_sha), "message": message } }),
             );
-            return None;
+            return;
         }
     }
 
@@ -891,19 +989,19 @@ pub fn handle_rest_request(
         if method == "GET" {
             let list: Vec<Value> = store.repos[repo_idx].labels.iter().map(format_label_val).collect();
             write_http_json(resp_out, "200 OK", "", &Value::Array(list));
-            return None;
+            return;
         }
         if method == "POST" {
             let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             if name.is_empty() {
                 write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"Label name is required\"}\n");
-                return None;
+                return;
             }
             let color = body.get("color").and_then(|v| v.as_str()).unwrap_or("ededed").to_string();
             let desc = body.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let lbl = store.create_label(repo_idx, name, color, desc);
             write_http_json(resp_out, "201 Created", "", &format_label_val(&lbl));
-            return None;
+            return;
         }
     }
 
@@ -936,7 +1034,7 @@ pub fn handle_rest_request(
         let slice = if start < items.len() { &items[start..end] } else { &[] };
         let vals: Vec<Value> = slice.iter().map(|i| format_issue_val(i)).collect();
         write_http_json(resp_out, "200 OK", "", &Value::Array(vals));
-        return None;
+        return;
     }
 
     if let Some(after_issues) = sub_path.strip_prefix("issues/") {
@@ -947,7 +1045,7 @@ pub fn handle_rest_request(
                 if parts.next().is_none() {
                     if store.repos[repo_idx].get_issue(num).is_none() {
                         write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                        return None;
+                        return;
                     }
                     match sub {
                         Some("comments") => {
@@ -960,13 +1058,13 @@ pub fn handle_rest_request(
                                     .map(format_comment_val)
                                     .collect();
                                 write_http_json(resp_out, "200 OK", "", &Value::Array(comments));
-                                return None;
+                                return;
                             }
                             if method == "POST" {
                                 let cbody = body.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let c = store.add_issue_comment(repo_idx, num, cbody).unwrap();
                                 write_http_json(resp_out, "201 Created", "", &format_comment_val(&c));
-                                return None;
+                                return;
                             }
                         }
                         None => {
@@ -992,7 +1090,7 @@ pub fn handle_rest_request(
                                 issue.updated_at = upd_ts;
                                 issue.cached_http_get = None;
                                 write_http_json(resp_out, "200 OK", "", &format_issue_val(issue));
-                                return None;
+                                return;
                             }
                         }
                         _ => {}
@@ -1016,7 +1114,7 @@ pub fn handle_rest_request(
                 .map(|p| format_pull_val(repo, p))
                 .collect();
             write_http_json(resp_out, "200 OK", "", &Value::Array(items));
-            return None;
+            return;
         }
         if method == "POST" {
             let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1029,7 +1127,7 @@ pub fn handle_rest_request(
                 .unwrap_or_else(|| store.repos[repo_idx].default_branch.clone());
             if title.is_empty() || head.is_empty() {
                 write_http_json_raw(resp_out, "422 Unprocessable Entity", "", b"{\"message\":\"title and head are required\"}\n");
-                return None;
+                return;
             }
             let pbody = body.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
             match store.create_pull(repo_idx, title, pbody, head, base) {
@@ -1042,7 +1140,7 @@ pub fn handle_rest_request(
                     write_http_json(resp_out, "422 Unprocessable Entity", "", &json!({ "message": e }));
                 }
             }
-            return None;
+            return;
         }
     }
 
@@ -1054,14 +1152,14 @@ pub fn handle_rest_request(
                 if parts.next().is_none() {
                     if store.repos[repo_idx].get_pull(num).is_none() {
                         write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-                        return None;
+                        return;
                     }
                     match (action, method) {
                         (None, "GET") => {
                             let repo = &store.repos[repo_idx];
                             let pull = repo.get_pull(num).unwrap();
                             write_http_json(resp_out, "200 OK", "", &format_pull_val(repo, pull));
-                            return None;
+                            return;
                         }
                         (Some("files"), "GET") => {
                             let repo = &store.repos[repo_idx];
@@ -1080,12 +1178,12 @@ pub fn handle_rest_request(
                                 })
                                 .collect();
                             write_http_json(resp_out, "200 OK", "", &Value::Array(arr));
-                            return None;
+                            return;
                         }
                         (Some("merge"), "PUT") => {
                             if store.repos[repo_idx].get_pull(num).unwrap().merged {
                                 write_http_json_raw(resp_out, "405 Method Not Allowed", "", b"{\"message\":\"Pull Request is already merged\"}\n");
-                                return None;
+                                return;
                             }
                             let msg = body.get("commit_message").and_then(|v| v.as_str());
                             match store.squash_merge(repo_idx, num, msg) {
@@ -1101,7 +1199,7 @@ pub fn handle_rest_request(
                                     write_http_json_raw(resp_out, "405 Method Not Allowed", "", b"{\"message\":\"Pull Request is not mergeable\"}\n");
                                 }
                             }
-                            return None;
+                            return;
                         }
                         _ => {}
                     }
@@ -1111,5 +1209,4 @@ pub fn handle_rest_request(
     }
 
     write_http_json_raw(resp_out, "404 Not Found", "", b"{\"message\":\"Not Found\"}\n");
-    None
 }

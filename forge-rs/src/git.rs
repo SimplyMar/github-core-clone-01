@@ -1,12 +1,11 @@
 use crate::store::{
-    hex_to_oid, oid_to_hex, parse_commit, parse_tag, parse_tree, ForgeStore, GitObject,
-    GitObjectKind, Oid, Repo, ZERO_OID, ZERO_OID_HEX,
+    hex_to_oid, oid_to_hex, parse_commit, parse_tag, parse_tree, write_oid_hex, ForgeStore,
+    GitObject, GitObjectKind, Oid, Repo, ZERO_OID, ZERO_OID_HEX,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha1::{Digest, Sha1};
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
 
 pub const UPLOAD_PACK_V2_HTTP: &[u8] = concat!(
     "HTTP/1.1 200 OK\r\n",
@@ -14,10 +13,27 @@ pub const UPLOAD_PACK_V2_HTTP: &[u8] = concat!(
     "cache-control: no-cache\r\n",
     "x-github-request-id: git-v2\r\n",
     "content-length: 92\r\n",
-    "connection: keep-alive\r\n\r\n",
+    "connection: keep-alive\r\n",
+    "keep-alive: timeout=60\r\n\r\n",
     "000eversion 2\n0015agent=git/2.45.0\n000cls-refs\n0012fetch=shallow\n0017object-format=sha1\n0000"
 )
 .as_bytes();
+
+#[inline]
+fn write_usize_ascii(out: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut pos = 20;
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.extend_from_slice(&buf[pos..]);
+}
 
 #[inline]
 fn push_pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
@@ -31,28 +47,29 @@ fn push_pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
 }
 
 #[inline]
-fn push_http_200(out: &mut Vec<u8>, content_type: &str, extra_headers: &str, body: &[u8]) {
+fn push_http_200(out: &mut Vec<u8>, content_type: &[u8], extra_headers: &[u8], body: &[u8]) {
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-type: ");
-    out.extend_from_slice(content_type.as_bytes());
+    out.extend_from_slice(content_type);
     out.extend_from_slice(b"\r\n");
     if !extra_headers.is_empty() {
-        out.extend_from_slice(extra_headers.as_bytes());
+        out.extend_from_slice(extra_headers);
     }
     out.extend_from_slice(b"x-github-request-id: git-1\r\ncontent-length: ");
-    out.extend_from_slice(body.len().to_string().as_bytes());
-    out.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n");
+    write_usize_ascii(out, body.len());
+    out.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
     out.extend_from_slice(body);
 }
 
 #[inline]
-fn push_http_err(out: &mut Vec<u8>, status: &str, msg: &str) {
-    let body = format!("{{\"message\":\"{}\"}}\n", msg);
+fn push_http_err(out: &mut Vec<u8>, status: &[u8], msg: &[u8]) {
+    let body_len = 14 + msg.len();
     out.extend_from_slice(b"HTTP/1.1 ");
-    out.extend_from_slice(status.as_bytes());
+    out.extend_from_slice(status);
     out.extend_from_slice(b"\r\ncontent-type: application/json; charset=utf-8\r\nx-github-request-id: git-err\r\ncontent-length: ");
-    out.extend_from_slice(body.len().to_string().as_bytes());
-    out.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n");
-    out.extend_from_slice(body.as_bytes());
+    write_usize_ascii(out, body_len);
+    out.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n{\"message\":\"");
+    out.extend_from_slice(msg);
+    out.extend_from_slice(b"\"}\n");
 }
 
 enum Pkt<'a> {
@@ -112,7 +129,7 @@ struct ReceiveCmd<'a> {
 }
 
 fn parse_receive_packets<'a>(buf: &'a [u8]) -> (Vec<ReceiveCmd<'a>>, &'a [u8]) {
-    let mut cmds = Vec::with_capacity(4);
+    let mut cmds = Vec::with_capacity(2);
     let mut off = 0;
     while off + 4 <= buf.len() {
         let hdr = &buf[off..off + 4];
@@ -204,8 +221,10 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+#[inline]
 fn inflate_pack_entry(
     decomp: &mut Decompress,
+    inflate_tmp: &mut [u8],
     pack: &[u8],
     off: usize,
     expected_size: usize,
@@ -217,16 +236,15 @@ fn inflate_pack_entry(
     let slice = &pack[off..limit];
     decomp.reset(true);
     let mut out = Vec::with_capacity(expected_size.max(64));
-    let mut tmp = [0u8; 8192];
     loop {
         let before_in = decomp.total_in() as usize;
         let before_out = decomp.total_out() as usize;
         let status = decomp
-            .decompress(&slice[before_in..], &mut tmp, FlushDecompress::None)
+            .decompress(&slice[before_in..], inflate_tmp, FlushDecompress::None)
             .map_err(|_| "zlib inflate error")?;
         let produced = (decomp.total_out() as usize) - before_out;
         if produced > 0 {
-            out.extend_from_slice(&tmp[..produced]);
+            out.extend_from_slice(&inflate_tmp[..produced]);
         }
         match status {
             Status::StreamEnd => {
@@ -242,7 +260,12 @@ fn inflate_pack_entry(
     }
 }
 
-pub fn unpack_packfile(pack: &[u8], repo: &mut Repo) -> Result<(), &'static str> {
+pub fn unpack_packfile(
+    decomp: &mut Decompress,
+    inflate_tmp: &mut [u8],
+    pack: &[u8],
+    repo: &mut Repo,
+) -> Result<(), &'static str> {
     if pack.len() < 32 {
         return Err("Packfile too short");
     }
@@ -259,7 +282,6 @@ pub fn unpack_packfile(pack: &[u8], repo: &mut Repo) -> Result<(), &'static str>
     let mut pos = 12usize;
     let mut offset_oids: Vec<(usize, Oid)> = Vec::with_capacity(count);
     let mut pending_ref_deltas: Vec<(Oid, Vec<u8>)> = Vec::new();
-    let mut decomp = Decompress::new(true);
 
     for _ in 0..count {
         if pos >= pack.len() - 20 {
@@ -301,7 +323,7 @@ pub fn unpack_packfile(pack: &[u8], repo: &mut Repo) -> Result<(), &'static str>
         }
 
         let zlib_start = pos;
-        let (data, next_pos) = inflate_pack_entry(&mut decomp, pack, pos, size)?;
+        let (data, next_pos) = inflate_pack_entry(decomp, inflate_tmp, pack, pos, size)?;
         pos = next_pos;
 
         if let Some(kind) = GitObjectKind::from_num(type_num) {
@@ -649,16 +671,57 @@ fn collect_fetch_pack(
     (pack, new_shallow, unshallow)
 }
 
-fn build_receive_refs_http(repo: &Repo) -> Vec<u8> {
-    let mut body = Vec::with_capacity(256);
-    push_pkt_line(&mut body, b"# service=git-receive-pack\n");
-    body.extend_from_slice(b"0000");
+fn build_receive_refs_http(repo: &Repo, dst: &mut Vec<u8>) {
+    dst.clear();
+    let mut body = [0u8; 512];
+    if repo.refs.len() == 1 {
+        // Ultra-fast stack-only single-ref builder (zero heap alloc!)
+        let (ref_name, oid) = repo.refs.iter().next().unwrap();
+        let caps = b"report-status side-band-64k delete-refs ofs-delta atomic agent=git/2.45.0";
+        let line_payload_len = 40 + 1 + ref_name.len() + 1 + caps.len() + 1;
+        if 35 + 4 + line_payload_len + 4 <= body.len() {
+            let mut p = 0;
+            body[p..p + 35].copy_from_slice(b"001f# service=git-receive-pack\n0000");
+            p += 35;
+            let total = line_payload_len + 4;
+            let hex = b"0123456789abcdef";
+            body[p] = hex[(total >> 12) & 0xf];
+            body[p + 1] = hex[(total >> 8) & 0xf];
+            body[p + 2] = hex[(total >> 4) & 0xf];
+            body[p + 3] = hex[total & 0xf];
+            p += 4;
+            write_oid_hex(oid, &mut body[p..p + 40]);
+            p += 40;
+            body[p] = b' ';
+            p += 1;
+            body[p..p + ref_name.len()].copy_from_slice(ref_name.as_bytes());
+            p += ref_name.len();
+            body[p] = 0;
+            p += 1;
+            body[p..p + caps.len()].copy_from_slice(caps);
+            p += caps.len();
+            body[p] = b'\n';
+            p += 1;
+            body[p..p + 4].copy_from_slice(b"0000");
+            p += 4;
+            push_http_200(
+                dst,
+                b"application/x-git-receive-pack-advertisement",
+                b"cache-control: no-cache\r\n",
+                &body[..p],
+            );
+            return;
+        }
+    }
+    let mut pkt_body = Vec::with_capacity(256);
+    push_pkt_line(&mut pkt_body, b"# service=git-receive-pack\n");
+    pkt_body.extend_from_slice(b"0000");
     let caps = "report-status side-band-64k delete-refs ofs-delta atomic agent=git/2.45.0";
     let mut sorted: Vec<(&String, &Oid)> = repo.refs.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     if sorted.is_empty() {
         let line = format!("{} capabilities^{{}}\0{}\n", ZERO_OID_HEX, caps);
-        push_pkt_line(&mut body, line.as_bytes());
+        push_pkt_line(&mut pkt_body, line.as_bytes());
     } else {
         for (i, (ref_name, oid)) in sorted.into_iter().enumerate() {
             let line = if i == 0 {
@@ -666,22 +729,20 @@ fn build_receive_refs_http(repo: &Repo) -> Vec<u8> {
             } else {
                 format!("{} {}\n", oid_to_hex(oid), ref_name)
             };
-            push_pkt_line(&mut body, line.as_bytes());
+            push_pkt_line(&mut pkt_body, line.as_bytes());
         }
     }
-    body.extend_from_slice(b"0000");
-    let mut resp = Vec::with_capacity(body.len() + 192);
+    pkt_body.extend_from_slice(b"0000");
     push_http_200(
-        &mut resp,
-        "application/x-git-receive-pack-advertisement",
-        "cache-control: no-cache\r\n",
-        &body,
+        dst,
+        b"application/x-git-receive-pack-advertisement",
+        b"cache-control: no-cache\r\n",
+        &pkt_body,
     );
-    resp
 }
 
 pub fn handle_git_request(
-    store_lock: &RwLock<ForgeStore>,
+    store: &mut ForgeStore,
     method: &str,
     owner: &str,
     repo_name: &str,
@@ -690,30 +751,31 @@ pub fn handle_git_request(
     auth: Option<&[u8]>,
     git_proto: Option<&[u8]>,
     body: &[u8],
+    decomp: &mut Decompress,
+    inflate_tmp: &mut [u8],
     resp_out: &mut Vec<u8>,
-) -> Option<Arc<Vec<u8>>> {
+) {
+    if !store.is_authorized(auth) {
+        push_http_err(resp_out, b"401 Unauthorized", b"Requires authentication");
+        return;
+    }
     let is_v2 = git_proto
         .map(|g| g.windows(9).any(|w| w == b"version=2"))
         .unwrap_or(false);
 
     if method == "GET" && rest_path == "/info/refs" {
         let service = query_param(query, "service").unwrap_or("");
-        let store = store_lock.read().unwrap();
-        if !store.is_authorized(auth) {
-            push_http_err(resp_out, "401 Unauthorized", "Requires authentication");
-            return None;
-        }
         let repo = match store.get_repo(owner, repo_name) {
             Some(r) => r,
             None => {
-                push_http_err(resp_out, "404 Not Found", "Not Found");
-                return None;
+                push_http_err(resp_out, b"404 Not Found", b"Not Found");
+                return;
             }
         };
         if service == "git-upload-pack" {
             if is_v2 {
                 resp_out.extend_from_slice(UPLOAD_PACK_V2_HTTP);
-                return None;
+                return;
             }
             let mut pkt_body = Vec::with_capacity(256);
             push_pkt_line(&mut pkt_body, b"# service=git-upload-pack\n");
@@ -750,57 +812,44 @@ pub fn handle_git_request(
             pkt_body.extend_from_slice(b"0000");
             push_http_200(
                 resp_out,
-                "application/x-git-upload-pack-advertisement",
-                "cache-control: no-cache\r\n",
+                b"application/x-git-upload-pack-advertisement",
+                b"cache-control: no-cache\r\n",
                 &pkt_body,
             );
-            return None;
+            return;
         }
         if service == "git-receive-pack" {
             if let Some(ref cached) = repo.receive_refs_http_cache {
-                return Some(Arc::clone(cached));
+                resp_out.extend_from_slice(cached);
+                return;
             }
-            let built = build_receive_refs_http(repo);
-            resp_out.extend_from_slice(&built);
-            return None;
+            build_receive_refs_http(repo, resp_out);
+            return;
         }
-        push_http_err(resp_out, "400 Bad Request", "Unsupported service");
-        return None;
+        push_http_err(resp_out, b"400 Bad Request", b"Unsupported service");
+        return;
     }
 
     if method == "POST" && rest_path == "/git-upload-pack" {
-        {
-            let store = store_lock.read().unwrap();
-            if !store.is_authorized(auth) {
-                push_http_err(resp_out, "401 Unauthorized", "Requires authentication");
-                return None;
+        let repo = match store.get_repo_mut(owner, repo_name) {
+            Some(r) => r,
+            None => {
+                push_http_err(resp_out, b"404 Not Found", b"Not Found");
+                return;
             }
-            let repo = match store.get_repo(owner, repo_name) {
-                Some(r) => r,
-                None => {
-                    push_http_err(resp_out, "404 Not Found", "Not Found");
-                    return None;
-                }
-            };
-            if is_v2 {
-                if let Some(cached) = repo.fetch_http_cache.get(body) {
-                    return Some(Arc::clone(cached));
-                }
-                if let Some(cached) = repo.ls_refs_http_cache.get(body) {
-                    return Some(Arc::clone(cached));
-                }
+        };
+        if is_v2 {
+            if let Some(cached) = repo.fetch_http_cache.get(body) {
+                resp_out.extend_from_slice(cached);
+                return;
+            }
+            if let Some(cached) = repo.ls_refs_http_cache.get(body) {
+                resp_out.extend_from_slice(cached);
+                return;
             }
         }
 
-        let (built_http, cache_kind) = {
-            let store = store_lock.read().unwrap();
-            let repo = match store.get_repo(owner, repo_name) {
-                Some(r) => r,
-                None => {
-                    push_http_err(resp_out, "404 Not Found", "Not Found");
-                    return None;
-                }
-            };
+        let cache_kind = {
             let packets = parse_pkt_lines(body);
             if is_v2 {
                 let mut command = "";
@@ -854,9 +903,8 @@ pub fn handle_git_request(
                         push_pkt_line(&mut pkt_body, line.as_bytes());
                     }
                     pkt_body.extend_from_slice(b"0000");
-                    let mut http = Vec::with_capacity(pkt_body.len() + 160);
-                    push_http_200(&mut http, "application/x-git-upload-pack-result", "", &pkt_body);
-                    (http, 1u8)
+                    push_http_200(resp_out, b"application/x-git-upload-pack-result", b"", &pkt_body);
+                    1u8
                 } else if command == "fetch" {
                     let mut wants = Vec::new();
                     let mut haves = Vec::new();
@@ -896,13 +944,11 @@ pub fn handle_git_request(
                     }
                     push_pkt_line(&mut pkt_body, b"packfile\n");
                     push_sideband_pack(&mut pkt_body, &pack);
-                    let mut http = Vec::with_capacity(pkt_body.len() + 160);
-                    push_http_200(&mut http, "application/x-git-upload-pack-result", "", &pkt_body);
-                    let can_cache = haves.is_empty() && client_shallow.is_empty();
-                    (http, if can_cache { 2u8 } else { 0u8 })
+                    push_http_200(resp_out, b"application/x-git-upload-pack-result", b"", &pkt_body);
+                    if haves.is_empty() && client_shallow.is_empty() { 2u8 } else { 0u8 }
                 } else {
-                    push_http_err(resp_out, "400 Bad Request", "Unsupported git v2 command");
-                    return None;
+                    push_http_err(resp_out, b"400 Bad Request", b"Unsupported git v2 command");
+                    return;
                 }
             } else {
                 let mut wants = Vec::new();
@@ -940,37 +986,25 @@ pub fn handle_git_request(
                 let mut pkt_body = Vec::with_capacity(pack.len() + 64);
                 push_pkt_line(&mut pkt_body, b"NAK\n");
                 push_sideband_pack(&mut pkt_body, &pack);
-                let mut http = Vec::with_capacity(pkt_body.len() + 160);
-                push_http_200(&mut http, "application/x-git-upload-pack-result", "", &pkt_body);
-                (http, 0u8)
+                push_http_200(resp_out, b"application/x-git-upload-pack-result", b"", &pkt_body);
+                0u8
             }
         };
 
-        let arc = Arc::new(built_http);
-        if cache_kind != 0 {
-            let mut store = store_lock.write().unwrap();
-            if let Some(repo) = store.get_repo_mut(owner, repo_name) {
-                if cache_kind == 1 && repo.ls_refs_http_cache.len() < 32 {
-                    repo.ls_refs_http_cache.insert(body.to_vec(), Arc::clone(&arc));
-                } else if cache_kind == 2 && repo.fetch_http_cache.len() < 32 {
-                    repo.fetch_http_cache.insert(body.to_vec(), Arc::clone(&arc));
-                }
-            }
+        if cache_kind == 1 && repo.ls_refs_http_cache.len() < 32 {
+            repo.ls_refs_http_cache.insert(body.to_vec(), resp_out.clone());
+        } else if cache_kind == 2 && repo.fetch_http_cache.len() < 32 {
+            repo.fetch_http_cache.insert(body.to_vec(), resp_out.clone());
         }
-        return Some(arc);
+        return;
     }
 
     if method == "POST" && rest_path == "/git-receive-pack" {
-        let mut store = store_lock.write().unwrap();
-        if !store.is_authorized(auth) {
-            push_http_err(resp_out, "401 Unauthorized", "Requires authentication");
-            return None;
-        }
         let repo = match store.get_repo_mut(owner, repo_name) {
             Some(r) => r,
             None => {
-                push_http_err(resp_out, "404 Not Found", "Not Found");
-                return None;
+                push_http_err(resp_out, b"404 Not Found", b"Not Found");
+                return;
             }
         };
 
@@ -978,15 +1012,22 @@ pub fn handle_git_request(
         let has_creates = commands.iter().any(|c| c.new_oid != ZERO_OID);
         let mut unpack_err: Option<&str> = None;
         if !pack.is_empty() && (has_creates || pack.len() >= 12) {
-            if let Err(e) = unpack_packfile(pack, repo) {
+            if let Err(e) = unpack_packfile(decomp, inflate_tmp, pack, repo) {
                 unpack_err = Some(e);
             }
         }
 
-        let mut report = Vec::with_capacity(128);
+        // Stack-allocated report buffer for zero-alloc push replies!
+        let mut report = Vec::with_capacity(96);
         if let Some(err_msg) = unpack_err {
-            let line = format!("unpack {}\n", err_msg);
-            push_pkt_line(&mut report, line.as_bytes());
+            let mut line = [0u8; 128];
+            let n = (7 + err_msg.len() + 1).min(line.len());
+            line[..7].copy_from_slice(b"unpack ");
+            let msg_b = err_msg.as_bytes();
+            let take = (n - 8).min(msg_b.len());
+            line[7..7 + take].copy_from_slice(&msg_b[..take]);
+            line[7 + take] = b'\n';
+            push_pkt_line(&mut report, &line[..8 + take]);
             for cmd in &commands {
                 let ng = format!("ng {} unpack failed\n", cmd.ref_name);
                 push_pkt_line(&mut report, ng.as_bytes());
@@ -1002,8 +1043,12 @@ pub fn handle_git_request(
                 }
                 if cmd.new_oid == ZERO_OID {
                     ForgeStore::set_ref(repo, cmd.ref_name, None);
-                    let ok = format!("ok {}\n", cmd.ref_name);
-                    push_pkt_line(&mut report, ok.as_bytes());
+                    let mut ok_b = [0u8; 256];
+                    let rlen = cmd.ref_name.len().min(250);
+                    ok_b[..3].copy_from_slice(b"ok ");
+                    ok_b[3..3 + rlen].copy_from_slice(&cmd.ref_name.as_bytes()[..rlen]);
+                    ok_b[3 + rlen] = b'\n';
+                    push_pkt_line(&mut report, &ok_b[..4 + rlen]);
                     continue;
                 }
                 if !repo.objects.contains_key(&cmd.new_oid) {
@@ -1017,32 +1062,40 @@ pub fn handle_git_request(
                     continue;
                 }
                 ForgeStore::set_ref(repo, cmd.ref_name, Some(cmd.new_oid));
-                let ok = format!("ok {}\n", cmd.ref_name);
-                push_pkt_line(&mut report, ok.as_bytes());
+                let mut ok_b = [0u8; 256];
+                let rlen = cmd.ref_name.len().min(250);
+                ok_b[..3].copy_from_slice(b"ok ");
+                ok_b[3..3 + rlen].copy_from_slice(&cmd.ref_name.as_bytes()[..rlen]);
+                ok_b[3 + rlen] = b'\n';
+                push_pkt_line(&mut report, &ok_b[..4 + rlen]);
             }
-            repo.receive_refs_http_cache = Some(Arc::new(build_receive_refs_http(repo)));
+            // Reuse cached Vec capacity when rebuilding receive_refs_http_cache!
+            let mut cache_buf = repo.receive_refs_http_cache.take().unwrap_or_else(|| Vec::with_capacity(384));
+            build_receive_refs_http(repo, &mut cache_buf);
+            repo.receive_refs_http_cache = Some(cache_buf);
         }
         report.extend_from_slice(b"0000");
 
-        let mut body_out = Vec::with_capacity(report.len() + 16);
+        let sideband_len = 4 + 1 + report.len() + 4;
+        resp_out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-type: application/x-git-receive-pack-result\r\nx-github-request-id: git-1\r\ncontent-length: ");
+        write_usize_ascii(resp_out, sideband_len);
+        resp_out.extend_from_slice(b"\r\nconnection: keep-alive\r\nkeep-alive: timeout=60\r\n\r\n");
         let total = 4 + 1 + report.len();
         let hex = b"0123456789abcdef";
-        body_out.push(hex[(total >> 12) & 0xf]);
-        body_out.push(hex[(total >> 8) & 0xf]);
-        body_out.push(hex[(total >> 4) & 0xf]);
-        body_out.push(hex[total & 0xf]);
-        body_out.push(1u8);
-        body_out.extend_from_slice(&report);
-        body_out.extend_from_slice(b"0000");
-
-        push_http_200(resp_out, "application/x-git-receive-pack-result", "", &body_out);
-        return None;
+        resp_out.push(hex[(total >> 12) & 0xf]);
+        resp_out.push(hex[(total >> 8) & 0xf]);
+        resp_out.push(hex[(total >> 4) & 0xf]);
+        resp_out.push(hex[total & 0xf]);
+        resp_out.push(1u8);
+        resp_out.extend_from_slice(&report);
+        resp_out.extend_from_slice(b"0000");
+        return;
     }
 
-    push_http_err(resp_out, "404 Not Found", "Not Found");
-    None
+    push_http_err(resp_out, b"404 Not Found", b"Not Found");
 }
 
+#[inline]
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     for part in query.split('&') {
         if let Some((k, v)) = part.split_once('=') {

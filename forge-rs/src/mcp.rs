@@ -4,7 +4,6 @@ use crate::rest::{
 };
 use crate::store::{oid_to_hex, ForgeStore};
 use serde_json::{json, Map, Value};
-use std::sync::RwLock;
 
 fn tools_list_value() -> Value {
     json!([
@@ -114,12 +113,11 @@ fn resolve_repo_args(store: &ForgeStore, args: &Map<String, Value>) -> Option<us
 }
 
 pub fn handle_mcp_request(
-    store_lock: &RwLock<ForgeStore>,
+    store: &mut ForgeStore,
     auth: Option<&[u8]>,
     raw_body: &[u8],
     resp_out: &mut Vec<u8>,
 ) {
-    let mut store = store_lock.write().unwrap();
     if !store.is_authorized(auth) {
         write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
         return;
@@ -234,7 +232,7 @@ pub fn handle_mcp_request(
                         send_ok(resp_out, tool_result(json!({ "error": "owner and repo are required" }), true));
                         return;
                     }
-                    match resolve_repo_args(&store, args) {
+                    match resolve_repo_args(store, args) {
                         Some(idx) => send_ok(resp_out, tool_result(format_repo_val(&store.repos[idx]), false)),
                         None => send_ok(resp_out, tool_result(json!({ "error": "Repository not found" }), true)),
                     }
@@ -247,7 +245,7 @@ pub fn handle_mcp_request(
                         send_ok(resp_out, tool_result(json!({ "error": "owner, repo, and title are required" }), true));
                         return;
                     }
-                    let idx = match resolve_repo_args(&store, args) {
+                    let idx = match resolve_repo_args(store, args) {
                         Some(i) => i,
                         None => {
                             send_ok(resp_out, tool_result(json!({ "error": "Repository not found" }), true));
@@ -270,7 +268,7 @@ pub fn handle_mcp_request(
                         send_ok(resp_out, tool_result(json!({ "error": "owner and repo are required" }), true));
                         return;
                     }
-                    let idx = match resolve_repo_args(&store, args) {
+                    let idx = match resolve_repo_args(store, args) {
                         Some(i) => i,
                         None => {
                             send_ok(resp_out, tool_result(json!({ "error": "Repository not found" }), true));
@@ -299,7 +297,7 @@ pub fn handle_mcp_request(
                         send_ok(resp_out, tool_result(json!({ "error": "owner, repo, title, head, and base are required" }), true));
                         return;
                     }
-                    let idx = match resolve_repo_args(&store, args) {
+                    let idx = match resolve_repo_args(store, args) {
                         Some(i) => i,
                         None => {
                             send_ok(resp_out, tool_result(json!({ "error": "Repository not found" }), true));
@@ -324,7 +322,7 @@ pub fn handle_mcp_request(
                         send_ok(resp_out, tool_result(json!({ "error": "owner, repo, and pull_number are required" }), true));
                         return;
                     }
-                    let idx = match resolve_repo_args(&store, args) {
+                    let idx = match resolve_repo_args(store, args) {
                         Some(i) => i,
                         None => {
                             send_ok(resp_out, tool_result(json!({ "error": "Pull request not found" }), true));

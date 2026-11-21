@@ -113,13 +113,13 @@ pub struct Issue {
     pub body: String,
     pub state: String,
     pub labels: Vec<Label>,
-    pub user: UserObj,
+    pub user: Arc<UserObj>,
     pub comments: Vec<IssueComment>,
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
     pub created_seq: u64,
-    pub cached_http_get: Option<Arc<Vec<u8>>>,
+    pub cached_http_get: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,9 +172,9 @@ pub struct Repo {
     pub pulls: Vec<PullRequest>,
     pub next_issue_number: u64,
     pub next_pull_number: u64,
-    pub receive_refs_http_cache: Option<Arc<Vec<u8>>>,
-    pub ls_refs_http_cache: FxHashMap<Vec<u8>, Arc<Vec<u8>>>,
-    pub fetch_http_cache: FxHashMap<Vec<u8>, Arc<Vec<u8>>>,
+    pub receive_refs_http_cache: Option<Vec<u8>>,
+    pub ls_refs_http_cache: FxHashMap<Vec<u8>, Vec<u8>>,
+    pub fetch_http_cache: FxHashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl Repo {
@@ -231,7 +231,7 @@ pub struct ForgeStore {
     pub token_expected: Vec<u8>,
     pub now_iso: String,
     pub epoch_sec: i64,
-    pub viewer: UserObj,
+    pub viewer: Arc<UserObj>,
     pub repos: Vec<Repo>,
     pub repo_by_name: FxHashMap<String, usize>,
     pub repo_by_id: FxHashMap<u64, usize>,
@@ -637,13 +637,13 @@ impl ForgeStore {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "adaiversen".to_string());
-        let viewer = UserObj {
+        let viewer = Arc::new(UserObj {
             id: 1000,
             node_id: encode_node_id("U", 1000),
             login,
             name: "ada iversen".to_string(),
             email: "adaiversen@example.invalid".to_string(),
-        };
+        });
         let bearer_expected = format!("Bearer {}", token).into_bytes();
         let token_expected = format!("token {}", token).into_bytes();
         Self {
@@ -738,7 +738,7 @@ impl ForgeStore {
             id,
             node_id: encode_node_id("R", id),
             name: name.clone(),
-            owner: self.viewer.clone(),
+            owner: (*self.viewer).clone(),
             full_name,
             description,
             private,
@@ -1203,7 +1203,7 @@ impl ForgeStore {
         self.next_comment_id += 1;
         let id = self.next_comment_id;
         let now = self.next_timestamp();
-        let user = self.viewer.clone();
+        let user = (*self.viewer).clone();
         let issue = self.repos[repo_idx].get_issue_mut(issue_number)?;
         let comment = IssueComment {
             id,
@@ -1248,7 +1248,7 @@ impl ForgeStore {
         self.next_pull_id += 1;
         let id = self.next_pull_id;
         let now = self.next_timestamp();
-        let user = self.viewer.clone();
+        let user = (*self.viewer).clone();
         let repo = &mut self.repos[repo_idx];
         let number = repo.next_pull_number;
         repo.next_pull_number += 1;

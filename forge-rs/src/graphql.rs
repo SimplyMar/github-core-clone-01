@@ -2,7 +2,6 @@ use crate::rest::{write_http_json, write_http_json_raw};
 use crate::store::{decode_node_id, oid_to_hex, ForgeStore, Issue, PullRequest, Repo};
 use rustc_hash::FxHashMap;
 use serde_json::{json, Map, Value};
-use std::sync::RwLock;
 
 #[derive(Clone, Debug)]
 struct FieldNode {
@@ -980,12 +979,11 @@ fn execute_doc(
 }
 
 pub fn handle_graphql_request(
-    store_lock: &RwLock<ForgeStore>,
+    store: &mut ForgeStore,
     auth: Option<&[u8]>,
     raw_body: &[u8],
     resp_out: &mut Vec<u8>,
 ) {
-    let mut store = store_lock.write().unwrap();
     if !store.is_authorized(auth) {
         write_http_json_raw(resp_out, "401 Unauthorized", "", b"{\"message\":\"Requires authentication\"}\n");
         return;
@@ -1004,7 +1002,7 @@ pub fn handle_graphql_request(
             let q = item.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let vars = item.get("variables").and_then(|v| v.as_object()).unwrap_or(&empty_vars);
             let op = item.get("operationName").and_then(|v| v.as_str());
-            results.push(execute_doc(&mut store, q, vars, op));
+            results.push(execute_doc(store, q, vars, op));
         }
         write_http_json(resp_out, "200 OK", "", &Value::Array(results));
         return;
@@ -1016,6 +1014,6 @@ pub fn handle_graphql_request(
     let q = parsed.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let vars = parsed.get("variables").and_then(|v| v.as_object()).unwrap_or(&empty_vars);
     let op = parsed.get("operationName").and_then(|v| v.as_str());
-    let res = execute_doc(&mut store, q, vars, op);
+    let res = execute_doc(store, q, vars, op);
     write_http_json(resp_out, "200 OK", "", &res);
 }
