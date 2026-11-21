@@ -1,22 +1,7 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
-//
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
-//
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
-
-import { createApp } from './app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { accessSync, chmodSync, constants, copyFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -24,24 +9,75 @@ if (ENV_URL === '') {
   process.exit(1);
 }
 
-/** How long one register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
 }
 
-/**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
- * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
- */
+function resolveBinaryPath(): string {
+  const root = dirname(fileURLToPath(import.meta.url));
+  if (process.platform === 'linux') {
+    const bundled = join(root, 'bin', 'forge');
+    if (existsSync(bundled)) {
+      try {
+        accessSync(bundled, constants.X_OK);
+        return bundled;
+      } catch {
+        const tmpBin = '/tmp/forge-bin';
+        if (!existsSync(tmpBin)) {
+          copyFileSync(bundled, tmpBin);
+          chmodSync(tmpBin, 0o755);
+        }
+        return tmpBin;
+      }
+    }
+  }
+  const winBin = join(root, 'bin', 'forge.exe');
+  if (existsSync(winBin)) return winBin;
+  throw new Error(`Native forge binary not found in ${join(root, 'bin')}`);
+}
+
+function startForgeBinary(): Promise<{ child: ChildProcess; port: number }> {
+  return new Promise((resolve, reject) => {
+    const binPath = resolveBinaryPath();
+    const child = spawn(binPath, [], {
+      env: { ...process.env, FORGE_BIND: '0.0.0.0:0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdoutBuf = '';
+    let settled = false;
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBuf += chunk.toString('utf8');
+      const match = stdoutBuf.match(/PORT\s+(\d+)/);
+      if (match && !settled) {
+        settled = true;
+        resolve({ child, port: parseInt(match[1], 10) });
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      process.stderr.write(chunk);
+    });
+    child.once('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+    child.once('exit', (code) => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`forge binary exited early with code ${code}`));
+      }
+    });
+  });
+}
+
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -52,7 +88,9 @@ async function register(port: number): Promise<void> {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      if (res.status === 400 || res.status === 405) {
+        throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      }
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
@@ -60,7 +98,6 @@ async function register(port: number): Promise<void> {
   }
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -70,29 +107,21 @@ async function waitForDone(): Promise<void> {
         if (body.done === true) return;
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // Retry until done
     }
     await sleep(retryDelay(attempt));
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
-  const server = createApp();
-  server.requestTimeout = 0;
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  const { child, port } = await startForgeBinary();
+  process.stdout.write(`[entry] native rust forge listening on port ${port}\n`);
 
-  await register(address.port);
+  await register(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  server.close();
+  child.kill('SIGTERM');
   process.stdout.write('[entry] done\n');
 }
 
